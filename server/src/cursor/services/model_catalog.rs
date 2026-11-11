@@ -213,8 +213,9 @@ struct DefaultModelNudgeDataResponse {
 
 const CLI_LOCAL_MODEL_API_KEY: &str = "cursor-byok-local";
 
-const CONTEXTS: [(&str, &str); 5] = [
+const CONTEXTS: [(&str, &str); 6] = [
     ("200k", "200K"),
+    ("256k", "256K"),
     ("356k", "356K"),
     ("500k", "500K"),
     ("800k", "800K"),
@@ -800,6 +801,24 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
         }
+    }
+
+    #[test]
+    fn context_options_include_256k_without_duplicating_custom_window() {
+        let expected = ["200k", "256k", "356k", "500k", "800k", "1m"];
+        for window in [None, Some(256_000)] {
+            let options = context_options(window);
+            assert_eq!(
+                options
+                    .iter()
+                    .map(|(value, _)| value.as_str())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+            assert_eq!(options[1].1, "256K");
+            assert_eq!(parse_token_count(&options[1].0), Some(256_000));
+        }
+        assert_eq!(DEFAULT_CONTEXT, "200k");
     }
 
     #[test]

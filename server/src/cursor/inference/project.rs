@@ -8,11 +8,65 @@ use crate::{
         proto::inference as pb,
     },
     model::{
-        ContentPart, ModelRequest, ModelSpec, ProjectedContent, ProjectedMessage, PromptSpec,
-        ProviderReplayState, Role, ToolCallContent, ToolDefinition, ToolResultContent,
+        parse_token_count, ContentPart, ModelRequest, ModelSpec, ProjectedContent,
+        ProjectedMessage, PromptSpec, ProviderReplayState, Role, ToolCallContent, ToolDefinition,
+        ToolResultContent,
     },
     Error, Result,
 };
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn context_selection_is_preserved_for_plugin_and_builtin_models() {
+        for model_id in ["plugin:test:model", "builtin-model"] {
+            let mut input = pb::InferenceStreamRequest::default();
+            assert_eq!(
+                project(&input, model_id)
+                    .unwrap()
+                    .model
+                    .context_window_tokens,
+                None
+            );
+            input.requested_model = Some(pb::InferenceRequestedModel {
+                model_id: model_id.into(),
+                parameters: vec![pb::InferenceModelParameterValue {
+                    id: "context".into(),
+                    value: "356k".into(),
+                }],
+                ..Default::default()
+            });
+            assert_eq!(
+                project(&input, model_id)
+                    .unwrap()
+                    .model
+                    .context_window_tokens,
+                Some(356_000)
+            );
+            input.requested_model.as_mut().unwrap().parameters[0].value = "invalid".into();
+            assert!(project(&input, model_id).is_err());
+        }
+    }
+}
+
+pub(crate) fn selected_context(model: Option<&pb::InferenceRequestedModel>) -> Result<Option<u64>> {
+    model
+        .into_iter()
+        .flat_map(|model| &model.parameters)
+        .filter(|parameter| parameter.id == "context")
+        .try_fold(None, |_, parameter| {
+            parse_token_count(&parameter.value)
+                .map(Some)
+                .ok_or_else(|| {
+                    Error::Protocol(format!(
+                        "invalid Cursor context token count: {}",
+                        parameter.value
+                    ))
+                })
+        })
+}
 
 pub(crate) fn project(input: &pb::InferenceStreamRequest, model_id: &str) -> Result<ModelRequest> {
     let mut model = ModelSpec::new(model_id);
@@ -32,6 +86,7 @@ pub(crate) fn project(input: &pb::InferenceStreamRequest, model_id: &str) -> Res
         }
         model.extra_params = Value::Object(extra);
     }
+    model.context_window_tokens = selected_context(input.requested_model.as_ref())?;
     if let Some(requested) = &input.requested_model {
         model.reasoning.enabled = requested.max_mode;
         for parameter in &requested.parameters {

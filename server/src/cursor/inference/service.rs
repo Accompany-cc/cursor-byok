@@ -91,6 +91,12 @@ impl InferenceService {
             ));
         }
         let configured = self.registry.store().model(model_id).await?;
+        let context_window = super::project::selected_context(request.requested_model.as_ref())?
+            .or_else(|| {
+                configured
+                    .as_ref()
+                    .and_then(|model| model.context_window_tokens)
+            });
         let local = configured.is_some() || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX);
         let route = if local {
             tracing::info!(
@@ -111,7 +117,7 @@ impl InferenceService {
                 self.registry.provider(),
                 request_id.into(),
                 request.conversation_id.clone(),
-                model_id.into(),
+                (model_id.into(), context_window),
                 configured.map(|model| (model.display_name, model.model_type)),
             ));
             InferenceRoute::Local(run)
@@ -169,9 +175,10 @@ async fn serve(
     provider: Arc<dyn Provider>,
     run_id: String,
     conversation_id: String,
-    model_id: String,
+    model_selection: (String, Option<u64>),
     model_info: Option<(String, ModelType)>,
 ) {
+    let (model_id, context_window) = model_selection;
     let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
     let mut tasks = JoinSet::new();
     let mut finished = false;
@@ -200,13 +207,15 @@ async fn serve(
                     );
                     continue;
                 }
-                let request = match project(&request, &model_id) {
+                let mut request = match project(&request, &model_id) {
                     Ok(request) => request,
                     Err(error) => {
                         invocation_error(&output, id, &error.to_string());
                         continue;
                     }
                 };
+                request.model.context_window_tokens =
+                    request.model.context_window_tokens.or(context_window);
                 let cancellation = CancellationToken::new();
                 invocations.lock().insert(id.clone(), cancellation.clone());
                 tasks.spawn(serve_invocation(
@@ -301,13 +310,14 @@ async fn serve_invocation(
     invocation: ModelInvocation,
 ) {
     let id = invocation.call_id.clone();
+    let context_window = invocation.request.model.context_window_tokens;
     let mut stream = provider.stream(invocation, cancellation);
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
     let mut error = None;
     while let Some(next) = stream.next().await {
         match next {
             Ok(event) => {
-                if let Some(response) = model_response(event, &mut tool_calls) {
+                if let Some(response) = model_response(event, &mut tool_calls, context_window) {
                     emit(
                         &output,
                         pb::run_inference_server_message::Message::InvocationResponse(
@@ -344,6 +354,7 @@ async fn serve_invocation(
 fn model_response(
     event: ModelEvent,
     tool_calls: &mut HashMap<usize, (String, String, String)>,
+    context_window: Option<u64>,
 ) -> Option<pb::InferenceStreamResponse> {
     use pb::inference_stream_response::Response;
     let response = match event {
@@ -422,11 +433,12 @@ fn model_response(
             })
         }
         ModelEvent::Usage(usage) => Response::ExtendedUsage(pb::InferenceExtendedUsageInfo {
-            input_tokens: count(usage.input_tokens),
+            input_tokens: count(usage.context_input_tokens.or(usage.input_tokens)),
             output_tokens: count(usage.output_tokens),
             cache_read_tokens: count(usage.cache_read_tokens),
             cache_write_tokens: count(usage.cache_write_tokens),
-            ..Default::default()
+            max_tokens: count(context_window),
+            reasoning_tokens: usage.reasoning_tokens.map(|tokens| count(Some(tokens))),
         }),
         ModelEvent::Start { model_call_id } => {
             Response::InvocationId(pb::InferenceInvocationIdInfo {
@@ -491,4 +503,57 @@ fn emit(output: &OutputHub, message: pb::run_inference_server_message::Message) 
 
 pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage> {
     pb::RunInferenceClientMessage::decode(data).map_err(Error::from)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Usage;
+
+    #[test]
+    fn usage_preserves_context_counts_and_selected_window() {
+        let usage = Usage {
+            input_tokens: Some(100),
+            context_input_tokens: Some(65_000),
+            cache_read_tokens: Some(64_900),
+            reasoning_tokens: Some(12),
+            ..Default::default()
+        };
+        let response =
+            model_response(ModelEvent::Usage(usage), &mut HashMap::new(), Some(356_000)).unwrap();
+        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) = response.response
+        else {
+            panic!("expected extended usage");
+        };
+        assert_eq!(info.input_tokens, 65_000);
+        assert_eq!(info.max_tokens, 356_000);
+        assert_eq!(info.cache_read_tokens, 64_900);
+        assert_eq!(info.reasoning_tokens, Some(12));
+    }
+
+    #[test]
+    fn unknown_window_is_not_invented_and_counts_saturate() {
+        let response = model_response(
+            ModelEvent::Usage(Usage {
+                input_tokens: Some(u64::MAX),
+                ..Default::default()
+            }),
+            &mut HashMap::new(),
+            None,
+        )
+        .unwrap();
+        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) = response.response
+        else {
+            panic!("expected extended usage");
+        };
+        assert_eq!(info.input_tokens, i32::MAX);
+        assert_eq!(info.max_tokens, 0);
+        assert_eq!(count(Some(u64::MAX)), i32::MAX);
+        assert!(model_response(
+            ModelEvent::Done(crate::provider::FinishReason::Stop),
+            &mut HashMap::new(),
+            Some(356_000)
+        )
+        .is_none());
+    }
 }

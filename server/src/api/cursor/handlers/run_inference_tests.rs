@@ -31,17 +31,34 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn client_loop_receives_ready_text_tool_call_and_completion() {
-    assert_client_loop(false).await;
+    assert_client_loop(false, Some("356k"), None, 356_000).await;
 }
 
 #[tokio::test]
 async fn binary_client_loop_receives_ready_text_tool_call_and_completion() {
-    assert_client_loop(true).await;
+    assert_client_loop(true, Some("356k"), None, 356_000).await;
 }
 
-async fn assert_client_loop(binary: bool) {
+#[tokio::test]
+async fn client_loop_uses_configured_context_when_selection_is_absent() {
+    assert_client_loop(false, None, None, 1_000_000).await;
+}
+
+#[tokio::test]
+async fn invocation_context_overrides_run_context() {
+    assert_client_loop(false, Some("356k"), Some("500k"), 500_000).await;
+}
+
+async fn assert_client_loop(
+    binary: bool,
+    run_context: Option<&str>,
+    invoke_context: Option<&str>,
+    expected_context: i32,
+) {
     let (_directory, store) = temp_store().await;
-    let model = store.create_model(&model_input()).await.unwrap();
+    let mut input = model_input();
+    input.context_window_tokens = Some(1_000_000);
+    let model = store.create_model(&input).await.unwrap();
     let provider = FakeProvider::default();
     provider.push(vec![
         ModelEvent::Start {
@@ -64,6 +81,12 @@ async fn assert_client_loop(binary: bool) {
             delta: "{\"path\":\"a.rs\"}".into(),
         },
         ModelEvent::ToolCallEnd { index: 0 },
+        ModelEvent::Usage(crate::model::Usage {
+            input_tokens: Some(64_973),
+            output_tokens: Some(42),
+            cache_read_tokens: Some(60_000),
+            ..Default::default()
+        }),
         ModelEvent::Done(FinishReason::ToolUse),
     ]);
     let (_router_directory, router) = router(store, provider.clone());
@@ -111,6 +134,13 @@ async fn assert_client_loop(binary: bool) {
                     conversation_id: "conversation-test".into(),
                     requested_model: Some(pb::InferenceRequestedModel {
                         model_id: model.model_hash.clone(),
+                        parameters: run_context
+                            .into_iter()
+                            .map(|value| pb::InferenceModelParameterValue {
+                                id: "context".into(),
+                                value: value.into(),
+                            })
+                            .collect(),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -192,6 +222,14 @@ async fn assert_client_loop(binary: bool) {
                 pb::RunInferenceInvokeModel {
                     invocation_id: "invoke-1".into(),
                     request: Some(pb::InferenceStreamRequest {
+                        requested_model: invoke_context.map(|value| pb::InferenceRequestedModel {
+                            model_id: model.model_hash.clone(),
+                            parameters: vec![pb::InferenceModelParameterValue {
+                                id: "context".into(),
+                                value: value.into(),
+                            }],
+                            ..Default::default()
+                        }),
                         messages: vec![pb::InferenceCoreMessage {
                             role: 1,
                             content: Some(pb::inference_core_message::Content::Text(
@@ -219,6 +257,7 @@ async fn assert_client_loop(binary: bool) {
     let mut completed_tool = None;
     let mut signature = None;
     let mut invocation_id = None;
+    let mut usage = None;
     loop {
         let message = next_message(&mut stream).await;
         match message.message.unwrap() {
@@ -240,6 +279,9 @@ async fn assert_client_loop(binary: bool) {
                     pb::inference_stream_response::Response::InvocationId(info) => {
                         invocation_id = Some(info.invocation_id);
                     }
+                    pb::inference_stream_response::Response::ExtendedUsage(info) => {
+                        usage = Some(info);
+                    }
                     _ => {}
                 }
             }
@@ -256,7 +298,16 @@ async fn assert_client_loop(binary: bool) {
     assert_eq!(completed_tool.as_deref(), Some(tool.as_str()));
     assert_eq!(signature.as_deref(), Some("signature-1"));
     assert_eq!(invocation_id.as_deref(), Some("invoke-1"));
+    let usage = usage.expect("provider usage must reach the client loop");
+    assert_eq!(usage.input_tokens, 64_973);
+    assert_eq!(usage.output_tokens, 42);
+    assert_eq!(usage.cache_read_tokens, 60_000);
+    assert_eq!(usage.max_tokens, expected_context);
     let requests = provider.requests();
+    assert_eq!(
+        requests[0].model.context_window_tokens,
+        Some(expected_context as u64)
+    );
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].history.len(), 1);
     assert_eq!(requests[0].prompt.tools[0].name, "Read");
