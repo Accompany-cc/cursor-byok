@@ -341,9 +341,7 @@ async fn serve_invocation(
                     }
                     if !pending_tools.is_empty() {
                         for event in pending_tools.drain(..) {
-                            if let Some(response) =
-                                model_response(event, &mut tool_calls, context_window)
-                            {
+                            for response in model_response(event, &mut tool_calls, context_window) {
                                 emit(
                                     &output,
                                     pb::run_inference_server_message::Message::InvocationResponse(
@@ -358,7 +356,7 @@ async fn serve_invocation(
                     }
                     continue;
                 }
-                if let Some(response) = model_response(event, &mut tool_calls, context_window) {
+                for response in model_response(event, &mut tool_calls, context_window) {
                     emit(
                         &output,
                         pb::run_inference_server_message::Message::InvocationResponse(
@@ -440,9 +438,10 @@ fn model_response(
     event: ModelEvent,
     tool_calls: &mut HashMap<usize, (String, String, String)>,
     context_window: Option<u64>,
-) -> Option<pb::InferenceStreamResponse> {
+) -> Vec<pb::InferenceStreamResponse> {
     use pb::inference_stream_response::Response;
     let response = match event {
+        ModelEvent::Usage(usage) => return usage_responses(usage, context_window),
         ModelEvent::TextDelta(text) => Response::TextPart(pb::InferenceTextStreamPart {
             text,
             is_final: false,
@@ -495,7 +494,9 @@ fn model_response(
             })
         }
         ModelEvent::ToolCallArgumentsDelta { index, delta } => {
-            let (call_id, _, arguments) = tool_calls.get_mut(&index)?;
+            let Some((call_id, _, arguments)) = tool_calls.get_mut(&index) else {
+                return Vec::new();
+            };
             arguments.push_str(&delta);
             Response::ToolCallPart(pb::InferenceToolCallStreamPart {
                 tool_call_id: call_id.clone(),
@@ -507,7 +508,9 @@ fn model_response(
             })
         }
         ModelEvent::ToolCallEnd { index } => {
-            let (call_id, name, arguments) = tool_calls.remove(&index)?;
+            let Some((call_id, name, arguments)) = tool_calls.remove(&index) else {
+                return Vec::new();
+            };
             Response::ToolCallPart(pb::InferenceToolCallStreamPart {
                 tool_call_id: call_id,
                 tool_name: name,
@@ -517,14 +520,6 @@ fn model_response(
                 ..Default::default()
             })
         }
-        ModelEvent::Usage(usage) => Response::ExtendedUsage(pb::InferenceExtendedUsageInfo {
-            input_tokens: count(usage.context_input_tokens.or(usage.input_tokens)),
-            output_tokens: count(usage.output_tokens),
-            cache_read_tokens: count(usage.cache_read_tokens),
-            cache_write_tokens: count(usage.cache_write_tokens),
-            max_tokens: count(context_window),
-            reasoning_tokens: usage.reasoning_tokens.map(|tokens| count(Some(tokens))),
-        }),
         ModelEvent::Start { model_call_id } => {
             Response::InvocationId(pb::InferenceInvocationIdInfo {
                 invocation_id: model_call_id,
@@ -533,12 +528,48 @@ fn model_response(
         ModelEvent::TextStart
         | ModelEvent::ThinkingStart
         | ModelEvent::ProviderReplayState(_)
-        | ModelEvent::Done(_) => return None,
+        | ModelEvent::Done(_) => return Vec::new(),
     };
-    Some(pb::InferenceStreamResponse {
+    vec![pb::InferenceStreamResponse {
+        response: Some(response),
+        ..Default::default()
+    }]
+}
+
+fn usage_responses(
+    usage: crate::model::Usage,
+    context_window: Option<u64>,
+) -> Vec<pb::InferenceStreamResponse> {
+    use pb::inference_stream_response::Response;
+    let prompt_tokens = usage.context_input_tokens.or(usage.input_tokens);
+    let completion_tokens = usage.output_tokens;
+    let total_tokens = match (prompt_tokens, completion_tokens) {
+        (Some(prompt), Some(completion)) => Some(prompt.saturating_add(completion)),
+        (Some(prompt), None) => Some(prompt),
+        (None, Some(completion)) => Some(completion),
+        (None, None) => usage.total_tokens,
+    };
+    [
+        Response::Usage(pb::InferenceUsageInfo {
+            prompt_tokens: count(prompt_tokens),
+            completion_tokens: count(completion_tokens),
+            total_tokens: total_tokens.map(|tokens| count(Some(tokens))),
+        }),
+        Response::ExtendedUsage(pb::InferenceExtendedUsageInfo {
+            input_tokens: count(prompt_tokens),
+            output_tokens: count(completion_tokens),
+            cache_read_tokens: count(usage.cache_read_tokens),
+            cache_write_tokens: count(usage.cache_write_tokens),
+            max_tokens: count(context_window),
+            reasoning_tokens: usage.reasoning_tokens.map(|tokens| count(Some(tokens))),
+        }),
+    ]
+    .into_iter()
+    .map(|response| pb::InferenceStreamResponse {
         response: Some(response),
         ..Default::default()
     })
+    .collect()
 }
 
 fn agent_mode_configs() -> Vec<pb::RunInferenceAgentModeConfig> {
@@ -787,17 +818,29 @@ mod tests {
         let usage = Usage {
             input_tokens: Some(100),
             context_input_tokens: Some(65_000),
+            output_tokens: Some(42),
             cache_read_tokens: Some(64_900),
             reasoning_tokens: Some(12),
             ..Default::default()
         };
-        let response =
-            model_response(ModelEvent::Usage(usage), &mut HashMap::new(), Some(356_000)).unwrap();
-        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) = response.response
+        let responses =
+            model_response(ModelEvent::Usage(usage), &mut HashMap::new(), Some(356_000));
+        assert_eq!(responses.len(), 2);
+        let Some(pb::inference_stream_response::Response::Usage(info)) =
+            responses[0].response.as_ref()
+        else {
+            panic!("expected standard usage for Cursor context occupancy");
+        };
+        assert_eq!(info.prompt_tokens, 65_000);
+        assert_eq!(info.completion_tokens, 42);
+        assert_eq!(info.total_tokens, Some(65_042));
+        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) =
+            responses[1].response.as_ref()
         else {
             panic!("expected extended usage");
         };
         assert_eq!(info.input_tokens, 65_000);
+        assert_eq!(info.output_tokens, 42);
         assert_eq!(info.max_tokens, 356_000);
         assert_eq!(info.cache_read_tokens, 64_900);
         assert_eq!(info.reasoning_tokens, Some(12));
@@ -805,16 +848,24 @@ mod tests {
 
     #[test]
     fn unknown_window_is_not_invented_and_counts_saturate() {
-        let response = model_response(
+        let responses = model_response(
             ModelEvent::Usage(Usage {
                 input_tokens: Some(u64::MAX),
                 ..Default::default()
             }),
             &mut HashMap::new(),
             None,
-        )
-        .unwrap();
-        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) = response.response
+        );
+        assert_eq!(responses.len(), 2);
+        let Some(pb::inference_stream_response::Response::Usage(info)) =
+            responses[0].response.as_ref()
+        else {
+            panic!("expected standard usage");
+        };
+        assert_eq!(info.prompt_tokens, i32::MAX);
+        assert_eq!(info.total_tokens, Some(i32::MAX));
+        let Some(pb::inference_stream_response::Response::ExtendedUsage(info)) =
+            responses[1].response.as_ref()
         else {
             panic!("expected extended usage");
         };
@@ -826,6 +877,6 @@ mod tests {
             &mut HashMap::new(),
             Some(356_000)
         )
-        .is_none());
+        .is_empty());
     }
 }

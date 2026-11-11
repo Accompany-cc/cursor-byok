@@ -261,7 +261,8 @@ async fn assert_client_loop(
     let mut completed_tool = None;
     let mut signature = None;
     let mut invocation_id = None;
-    let mut usage = None;
+    let mut standard_usage = None;
+    let mut extended_usage = None;
     loop {
         let message = next_message(&mut stream).await;
         match message.message.unwrap() {
@@ -283,8 +284,11 @@ async fn assert_client_loop(
                     pb::inference_stream_response::Response::InvocationId(info) => {
                         invocation_id = Some(info.invocation_id);
                     }
+                    pb::inference_stream_response::Response::Usage(info) => {
+                        standard_usage = Some(info);
+                    }
                     pb::inference_stream_response::Response::ExtendedUsage(info) => {
-                        usage = Some(info);
+                        extended_usage = Some(info);
                     }
                     _ => {}
                 }
@@ -302,11 +306,15 @@ async fn assert_client_loop(
     assert_eq!(completed_tool.as_deref(), Some(tool.as_str()));
     assert_eq!(signature.as_deref(), Some("signature-1"));
     assert_eq!(invocation_id.as_deref(), Some("invoke-1"));
-    let usage = usage.expect("provider usage must reach the client loop");
-    assert_eq!(usage.input_tokens, 64_973);
-    assert_eq!(usage.output_tokens, 42);
-    assert_eq!(usage.cache_read_tokens, 60_000);
-    assert_eq!(usage.max_tokens, expected_context);
+    let standard_usage = standard_usage.expect("context occupancy must reach the client loop");
+    assert_eq!(standard_usage.prompt_tokens, 64_973);
+    assert_eq!(standard_usage.completion_tokens, 42);
+    assert_eq!(standard_usage.total_tokens, Some(65_015));
+    let extended_usage = extended_usage.expect("provider usage must reach the client loop");
+    assert_eq!(extended_usage.input_tokens, 64_973);
+    assert_eq!(extended_usage.output_tokens, 42);
+    assert_eq!(extended_usage.cache_read_tokens, 60_000);
+    assert_eq!(extended_usage.max_tokens, expected_context);
     let requests = provider.requests();
     assert_eq!(
         requests[0].model.context_window_tokens,
