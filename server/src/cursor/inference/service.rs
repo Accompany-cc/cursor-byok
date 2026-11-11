@@ -227,6 +227,7 @@ async fn serve(
                         call_id: id,
                         run_id: run_id.clone(),
                         conversation_id: conversation_id.clone(),
+                        prompt_cache_enabled: true,
                         provider_call_index,
                         request,
                     },
@@ -313,10 +314,50 @@ async fn serve_invocation(
     let context_window = invocation.request.model.context_window_tokens;
     let mut stream = provider.stream(invocation, cancellation);
     let mut tool_calls = HashMap::<usize, (String, String, String)>::new();
+    let mut pending_tools = Vec::new();
+    let mut terminal = false;
     let mut error = None;
     while let Some(next) = stream.next().await {
         match next {
             Ok(event) => {
+                if terminal {
+                    error = Some("provider emitted an event after Done".into());
+                    break;
+                }
+                if matches!(
+                    event,
+                    ModelEvent::ToolCallStart { .. }
+                        | ModelEvent::ToolCallArgumentsDelta { .. }
+                        | ModelEvent::ToolCallEnd { .. }
+                ) {
+                    pending_tools.push(event);
+                    continue;
+                }
+                if let ModelEvent::Done(finish) = event {
+                    terminal = true;
+                    if let Err(message) = validate_tool_delivery(&pending_tools, finish) {
+                        error = Some(message.into());
+                        break;
+                    }
+                    if !pending_tools.is_empty() {
+                        for event in pending_tools.drain(..) {
+                            if let Some(response) =
+                                model_response(event, &mut tool_calls, context_window)
+                            {
+                                emit(
+                                    &output,
+                                    pb::run_inference_server_message::Message::InvocationResponse(
+                                        pb::RunInferenceInvocationResponse {
+                                            invocation_id: id.clone(),
+                                            response: Some(response),
+                                        },
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let Some(response) = model_response(event, &mut tool_calls, context_window) {
                     emit(
                         &output,
@@ -335,6 +376,9 @@ async fn serve_invocation(
             }
         }
     }
+    if error.is_none() && !terminal && !pending_tools.is_empty() {
+        error = Some("provider stream ended before authorizing tool calls".into());
+    }
     invocations.lock().remove(&id);
     let message = pb::RunInferenceInvocationEnd {
         invocation_id: id,
@@ -349,6 +393,47 @@ async fn serve_invocation(
         &output,
         pb::run_inference_server_message::Message::InvocationEnd(message),
     );
+}
+
+fn validate_tool_delivery(
+    events: &[ModelEvent],
+    finish: crate::provider::FinishReason,
+) -> std::result::Result<(), &'static str> {
+    use crate::provider::FinishReason;
+    if events.is_empty() {
+        return if finish == FinishReason::ToolUse {
+            Err("provider reported tool use without tool calls")
+        } else {
+            Ok(())
+        };
+    }
+    if finish != FinishReason::ToolUse {
+        return Err("provider did not authorize streamed tool calls");
+    }
+    let mut calls = HashMap::new();
+    for event in events {
+        match event {
+            ModelEvent::ToolCallStart { index, .. } => {
+                if calls.insert(*index, false).is_some() {
+                    return Err("provider reused a tool index");
+                }
+            }
+            ModelEvent::ToolCallArgumentsDelta { index, .. } => {
+                if calls.get(index) != Some(&false) {
+                    return Err("provider emitted arguments for an unknown or ended tool");
+                }
+            }
+            ModelEvent::ToolCallEnd { index } => match calls.get_mut(index) {
+                Some(ended) if !*ended => *ended = true,
+                _ => return Err("provider ended an unknown or ended tool"),
+            },
+            _ => {}
+        }
+    }
+    if calls.is_empty() || calls.values().any(|ended| !ended) {
+        return Err("provider completed with unfinished tool calls");
+    }
+    Ok(())
 }
 
 fn model_response(
@@ -509,6 +594,193 @@ pub(crate) fn decode_append(data: &[u8]) -> Result<pb::RunInferenceClientMessage
 mod tests {
     use super::*;
     use crate::model::Usage;
+
+    #[tokio::test]
+    async fn anthropic_tool_end_before_done_is_delivered_only_for_authorized_turns() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (reason, message_stop, allowed) in [
+            ("tool_use", true, true),
+            ("end_turn", true, true),
+            ("end_turn", false, true),
+            ("refusal", true, false),
+            ("refusal", false, false),
+            ("max_tokens", true, false),
+        ] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let body = format!(
+                "data: {{\"type\":\"content_block_start\",\"index\":0,\"content_block\":{{\"type\":\"tool_use\",\"id\":\"tool\",\"name\":\"Shell\"}}}}\n\ndata: {{\"type\":\"content_block_delta\",\"index\":0,\"delta\":{{\"type\":\"input_json_delta\",\"partial_json\":\"{{}}\"}}}}\n\ndata: {{\"type\":\"content_block_stop\",\"index\":0}}\n\ndata: {{\"type\":\"message_delta\",\"delta\":{{\"stop_reason\":\"{reason}\"}}}}\n\n{}",
+                if message_stop { "data: {\"type\":\"message_stop\"}\n\n" } else { "" }
+            );
+            tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 8192];
+                let _ = socket.read(&mut request).await;
+                socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+            });
+            let provider = crate::provider::AnthropicProvider::new(
+                reqwest::Client::new(),
+                crate::config::ProviderConfig {
+                    kind: crate::config::ProviderKind::Anthropic,
+                    request_url: format!("http://{address}"),
+                    api_key: "test".into(),
+                    custom_headers: Default::default(),
+                    max_output_tokens: None,
+                    request_timeout: std::time::Duration::from_secs(5),
+                    allowed_body_fields: None,
+                },
+            );
+            let output = Arc::new(OutputHub::default());
+            let mut receiver = output.subscribe();
+            serve_invocation(
+                Arc::new(provider),
+                output,
+                Arc::new(Mutex::new(HashMap::new())),
+                CancellationToken::new(),
+                ModelInvocation {
+                    call_id: "call".into(),
+                    run_id: "run".into(),
+                    conversation_id: "conversation".into(),
+                    prompt_cache_enabled: true,
+                    provider_call_index: 0,
+                    request: crate::model::ModelRequest {
+                        prompt: crate::model::PromptSpec {
+                            instructions: String::new(),
+                            tools: vec![],
+                        },
+                        model: ModelSpec::new("test"),
+                        history: vec![],
+                    },
+                },
+            )
+            .await;
+            let mut tool_parts = Vec::new();
+            let mut ended = false;
+            while let Ok(frame) = receiver.try_recv() {
+                let (_, bytes) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+                match pb::RunInferenceServerMessage::decode(bytes)
+                    .unwrap()
+                    .message
+                    .unwrap()
+                {
+                    pb::run_inference_server_message::Message::InvocationResponse(response) => {
+                        if let Some(pb::inference_stream_response::Response::ToolCallPart(part)) =
+                            response.response.and_then(|response| response.response)
+                        {
+                            tool_parts.push(part);
+                        }
+                    }
+                    pb::run_inference_server_message::Message::InvocationEnd(end) => {
+                        ended = true;
+                        assert_eq!(
+                            end.error.is_none(),
+                            allowed,
+                            "{reason}, message_stop={message_stop}"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+            assert!(ended);
+            assert_eq!(tool_parts.len(), if allowed { 3 } else { 0 });
+            if allowed {
+                assert!(tool_parts.last().unwrap().is_complete);
+                assert_eq!(tool_parts.last().unwrap().args, "{}");
+            }
+        }
+    }
+
+    #[test]
+    fn tool_delivery_requires_complete_authorized_calls_but_plain_stops_are_valid() {
+        use crate::provider::FinishReason;
+        let events = vec![
+            ModelEvent::ToolCallStart {
+                index: 0,
+                call_id: "tool".into(),
+                name: "Shell".into(),
+            },
+            ModelEvent::ToolCallArgumentsDelta {
+                index: 0,
+                delta: "{}".into(),
+            },
+            ModelEvent::ToolCallEnd { index: 0 },
+        ];
+        assert!(validate_tool_delivery(&events, FinishReason::ToolUse).is_ok());
+        assert!(validate_tool_delivery(&events, FinishReason::Stop).is_err());
+        assert!(validate_tool_delivery(&events, FinishReason::Length).is_err());
+        assert!(validate_tool_delivery(&events[..2], FinishReason::ToolUse).is_err());
+        assert!(validate_tool_delivery(&events[1..], FinishReason::ToolUse).is_err());
+        assert!(validate_tool_delivery(&[], FinishReason::Stop).is_ok());
+        assert!(validate_tool_delivery(&[], FinishReason::Length).is_ok());
+        assert!(validate_tool_delivery(&[], FinishReason::ToolUse).is_err());
+    }
+
+    #[tokio::test]
+    async fn refused_inference_does_not_deliver_tools() {
+        struct Refused;
+        impl Provider for Refused {
+            fn stream(
+                &self,
+                _: ModelInvocation,
+                _: CancellationToken,
+            ) -> crate::provider::ProviderStream {
+                Box::pin(tokio_stream::iter(vec![
+                    Ok(ModelEvent::Start {
+                        model_call_id: "call".into(),
+                    }),
+                    Ok(ModelEvent::ToolCallStart {
+                        index: 0,
+                        call_id: "tool".into(),
+                        name: "Shell".into(),
+                    }),
+                    Ok(ModelEvent::ToolCallArgumentsDelta {
+                        index: 0,
+                        delta: "{}".into(),
+                    }),
+                    Ok(ModelEvent::ToolCallEnd { index: 0 }),
+                    Ok(ModelEvent::Done(crate::provider::FinishReason::Stop)),
+                ]))
+            }
+        }
+        let output = Arc::new(OutputHub::default());
+        let mut receiver = output.subscribe();
+        serve_invocation(
+            Arc::new(Refused),
+            output,
+            Arc::new(Mutex::new(HashMap::new())),
+            CancellationToken::new(),
+            ModelInvocation {
+                call_id: "call".into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                prompt_cache_enabled: true,
+                provider_call_index: 0,
+                request: crate::model::ModelRequest {
+                    prompt: crate::model::PromptSpec {
+                        instructions: String::new(),
+                        tools: vec![],
+                    },
+                    model: ModelSpec::new("test"),
+                    history: vec![],
+                },
+            },
+        )
+        .await;
+        let start = receiver.try_recv().unwrap();
+        let (_, bytes) = connect::decode_frames(&start).unwrap().pop().unwrap();
+        let message = pb::RunInferenceServerMessage::decode(bytes).unwrap();
+        assert!(matches!(
+            message.message,
+            Some(pb::run_inference_server_message::Message::InvocationResponse(_))
+        ));
+        let frame = receiver.try_recv().unwrap();
+        let (_, bytes) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        let message = pb::RunInferenceServerMessage::decode(bytes).unwrap();
+        assert!(
+            matches!(message.message, Some(pb::run_inference_server_message::Message::InvocationEnd(end)) if end.error.is_some())
+        );
+        assert!(receiver.try_recv().is_err());
+    }
 
     #[test]
     fn usage_preserves_context_counts_and_selected_window() {

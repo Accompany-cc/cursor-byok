@@ -1,4 +1,4 @@
-//! Sends one Provider HTTP attempt without applying retry policy.
+//! Sends bounded, cancellable HTTP attempts before a provider stream starts.
 
 use tokio_util::sync::CancellationToken;
 
@@ -10,6 +10,30 @@ use super::CallRecorder;
 pub(crate) enum Attempt {
     Response(reqwest::Response),
     Cancelled,
+}
+
+pub(crate) async fn send_with_retry<F>(
+    label: &str,
+    build: F,
+    cancellation: &CancellationToken,
+    recorder: Option<&CallRecorder>,
+) -> Result<Attempt>
+where
+    F: Fn() -> reqwest::RequestBuilder,
+{
+    for delay in [2, 5, 10] {
+        let attempt = send_once(label, &build, cancellation, recorder).await;
+        let retry = matches!(&attempt, Err(Error::Provider(message)) if message.starts_with(&format!("{label} 429 ")) || message.starts_with(&format!("{label} 502 ")) || message.starts_with(&format!("{label} 503 ")) || message.starts_with(&format!("{label} 504 ")));
+        if !retry {
+            return attempt;
+        }
+        tokio::select! {
+            biased;
+            _ = cancellation.cancelled() => return Ok(Attempt::Cancelled),
+            _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+        }
+    }
+    send_once(label, build, cancellation, recorder).await
 }
 
 pub(crate) async fn send_once<F>(
@@ -59,6 +83,35 @@ mod tests {
             socket.write_all(response).await.unwrap();
         });
         format!("http://{address}")
+    }
+
+    #[tokio::test]
+    async fn retry_backoff_can_be_cancelled_and_permanent_errors_are_not_retried() {
+        let url =
+            server(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 4\r\n\r\ndown").await;
+        let client = reqwest::Client::new();
+        let token = CancellationToken::new();
+        let cancel = token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_with_retry("test", || client.get(&url), &token, None),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(matches!(result, Attempt::Cancelled));
+        let url = server(b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\n\r\n").await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            send_with_retry("test", || client.get(&url), &CancellationToken::new(), None)
+        )
+        .await
+        .unwrap()
+        .is_err());
     }
 
     #[tokio::test]

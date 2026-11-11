@@ -111,6 +111,8 @@ impl Provider for ProviderRouter {
                     (recorder, guard, provider.stream(routed, cancellation.clone()))
                 };
 
+            let estimated_context = crate::model::estimate_context_tokens(&invocation.request.prompt, &invocation.request.history);
+            let mut saw_usage = false;
             let stream_started = std::time::Instant::now();
             tracing::debug!(
                 model = %selected,
@@ -152,7 +154,17 @@ impl Provider for ProviderRouter {
                                 "slow gap detected between provider events"
                             );
                         }
+                        saw_usage |= matches!(event, super::ModelEvent::Usage(_));
                         recorder.event(&event).await?;
+                        if !saw_usage && matches!(event, super::ModelEvent::Done(_)) {
+                            // Context estimates are not provider-reported billable token counts.
+                            let usage = super::ModelEvent::Usage(crate::model::Usage {
+                                context_input_tokens: Some(estimated_context),
+                                ..Default::default()
+                            });
+                            recorder.event(&usage).await?;
+                            yield usage;
+                        }
                         last_event_time = now;
                         yield event;
                     }
@@ -374,6 +386,75 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn missing_usage_estimates_context_without_inventing_billing_or_window() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 8192];
+            let _ = socket.read(&mut request).await;
+            let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"response\",\"status\":\"completed\",\"output\":[]}}\n\n";
+            socket.write_all(format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let config = store.create_model(&serde_json::from_value(serde_json::json!({
+            "display_name":"Test", "type":"openai", "base_url":format!("http://{address}/v1"),
+            "api_key":"test", "tooltip_data":"test", "model_id":"test"
+        })).unwrap()).await.unwrap();
+        let router = ProviderRouter::new(
+            store.clone(),
+            PluginRegistry::managed(
+                store.clone(),
+                crate::plugin::PluginRuntime::managed().unwrap(),
+                "test".into(),
+            )
+            .unwrap(),
+            crate::network::NetworkClients::new(store.clone()),
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+        );
+        let mut stream = router.stream(
+            ModelInvocation {
+                call_id: "missing-usage".into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                prompt_cache_enabled: true,
+                provider_call_index: 0,
+                request: crate::model::ModelRequest {
+                    model: crate::model::ModelSpec::new(&config.model_hash),
+                    prompt: crate::model::PromptSpec {
+                        instructions: "Estimate only context".into(),
+                        tools: vec![],
+                    },
+                    history: vec![],
+                },
+            },
+            CancellationToken::new(),
+        );
+        let mut usage = None;
+        while let Some(event) = stream.next().await {
+            if let super::super::ModelEvent::Usage(value) = event.unwrap() {
+                usage = Some(value);
+            }
+        }
+        let usage = usage.unwrap();
+        assert!(usage.context_input_tokens.unwrap() > 0);
+        assert_eq!(usage.input_tokens, None);
+        assert_eq!(usage.output_tokens, None);
+        assert_eq!(usage.total_tokens, None);
+        let call = store.llm_call("missing-usage").await.unwrap().unwrap();
+        assert_eq!(call.input_tokens, None);
+        assert_eq!(call.total_tokens, None);
+    }
+
+    #[tokio::test]
     async fn reasoning_precedence_plugin_wire_and_recording_agree() {
         use crate::model::{ModelConfigInput, ModelRequest, ModelSpec, ModelType};
         let directory = tempfile::tempdir().unwrap();
@@ -409,6 +490,7 @@ mod tests {
                 call_id: format!("call-{index}"),
                 run_id: "run".into(),
                 conversation_id: "conversation".into(),
+                prompt_cache_enabled: true,
                 provider_call_index: index,
                 request: ModelRequest {
                     model,

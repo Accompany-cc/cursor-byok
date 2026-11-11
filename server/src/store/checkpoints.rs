@@ -14,10 +14,11 @@ impl Store {
         &self,
         conversation_id: &ConversationId,
     ) -> Result<CheckpointId> {
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         let checkpoint = Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
         tx.commit().await?;
+        session.committed();
         Ok(checkpoint)
     }
 
@@ -101,8 +102,8 @@ impl Store {
         messages: &[CanonicalMessage],
     ) -> Result<CheckpointId> {
         let digest = message_digest(messages)?;
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         let current = Self::ensure_conversation_tx(&mut tx, conversation_id).await?;
         if let Some(existing) = sqlx::query_scalar::<_, i64>(
             "SELECT checkpoint_id FROM conversation_checkpoints
@@ -114,6 +115,7 @@ impl Store {
         .await?
         {
             tx.commit().await?;
+            session.committed();
             return Ok(CheckpointId(existing));
         }
 
@@ -133,6 +135,7 @@ impl Store {
         let checkpoint =
             Self::insert_checkpoint_tx(&mut tx, conversation_id, parent, additions, digest).await?;
         tx.commit().await?;
+        session.committed();
         Ok(checkpoint)
     }
 
@@ -149,8 +152,8 @@ impl Store {
         let mut full = self.load_checkpoint_messages(expected).await?;
         full.extend_from_slice(additions);
         let digest = message_digest(&full)?;
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         let checkpoint = Self::append_checkpoint_with_digest_tx(
             &mut tx,
             conversation_id,
@@ -161,6 +164,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        session.committed();
         Ok(checkpoint)
     }
 
@@ -172,8 +176,8 @@ impl Store {
         messages: &[CanonicalMessage],
     ) -> Result<CheckpointId> {
         let digest = message_digest(messages)?;
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         Self::require_active_head_tx(&mut tx, conversation_id, run_id, expected).await?;
         let root: i64 = sqlx::query_scalar(
             "SELECT checkpoint_id FROM conversation_checkpoints
@@ -214,6 +218,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        session.committed();
         Ok(checkpoint)
     }
 

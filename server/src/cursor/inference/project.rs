@@ -341,6 +341,7 @@ mod tests {
                 call_id: "call".into(),
                 run_id: "run".into(),
                 conversation_id: "conversation".into(),
+                prompt_cache_enabled: true,
                 provider_call_index: 0,
                 request,
             })

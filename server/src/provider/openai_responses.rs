@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     apply_body_allowlist, apply_openai_prompt_cache_key,
-    attempt::{send_once, Attempt},
+    attempt::{send_with_retry as send_once, Attempt},
     map_sse_error, merge_extra_params, provider_event_error,
     recorder::recorded_headers,
     CallRecorder, FinishReason, ModelEvent, Provider, ProviderStream,
@@ -68,6 +68,7 @@ impl Provider for OpenAiResponsesProvider {
         let config = self.config.clone();
         let recorder = self.recorder.clone();
         Box::pin(try_stream! {
+            let cache_key = invocation.cache_key();
             let ModelInvocation { call_id, request, .. } = invocation;
             let input = responses_input(&request.history)?;
             let mut body = json!({
@@ -83,7 +84,7 @@ impl Provider for OpenAiResponsesProvider {
             }
             apply_model(&mut body, &request.model, config.max_output_tokens)?;
             merge_extra_params(&mut body, &request.model.extra_params)?;
-            apply_openai_prompt_cache_key(&mut body, &request.model.model_id)?;
+            apply_openai_prompt_cache_key(&mut body, &request.model.model_id, cache_key.as_deref())?;
             apply_body_allowlist(&mut body, config.allowed_body_fields.as_ref())?;
             let request_headers = recorded_headers(&config, &[("content-type", "application/json")]);
             if let Some(recorder) = &recorder {
@@ -113,6 +114,7 @@ impl Provider for OpenAiResponsesProvider {
             futures_util::pin_mut!(source);
             let mut text_open = false;
             let mut text = String::new();
+            let mut text_index = None;
             let mut thinking_open = false;
             let mut tools = std::collections::BTreeMap::<usize, ResponseToolState>::new();
             let mut reasoning_items = Vec::new();
@@ -134,6 +136,7 @@ impl Provider for OpenAiResponsesProvider {
                 let kind = value.get("type").and_then(Value::as_str).unwrap_or(&event.event);
                 match kind {
                     "response.output_text.delta" => {
+                        enter_response_text_item(&value, &mut text_index, &mut text);
                         if thinking_open { thinking_open = false; yield ModelEvent::ThinkingEnd; }
                         if !text_open { text_open = true; yield ModelEvent::TextStart; }
                         if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -142,6 +145,7 @@ impl Provider for OpenAiResponsesProvider {
                         }
                     }
                     "response.output_text.done" => {
+                        enter_response_text_item(&value, &mut text_index, &mut text);
                         if let Some(final_text) = value.get("text").and_then(Value::as_str) {
                             for event in reconcile_response_text(&mut text_open, &mut text, final_text) { yield event; }
                         }
@@ -170,6 +174,7 @@ impl Provider for OpenAiResponsesProvider {
                             }
                             Some("message") => {
                                 saw_completed_item = true;
+                                enter_response_text_item(&value, &mut text_index, &mut text);
                                 if let Some(final_text) = response_item_text(item) {
                                     for event in reconcile_response_text(&mut text_open, &mut text, &final_text) { yield event; }
                                 }
@@ -282,6 +287,17 @@ fn response_item_text(item: &Value) -> Option<String> {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<String>();
     Some(text)
+}
+
+// Terminal text snapshots describe one output item, not the whole response.
+// Lenient relays without an index retain the current item's baseline.
+fn enter_response_text_item(value: &Value, current: &mut Option<u64>, streamed: &mut String) {
+    let Some(index) = value.get("output_index").and_then(Value::as_u64) else {
+        return;
+    };
+    if current.replace(index) != Some(index) {
+        streamed.clear();
+    }
 }
 
 fn reconcile_response_text(
@@ -543,6 +559,151 @@ pub(crate) fn responses_usage(value: &Value) -> Usage {
 mod tests {
     use super::*;
     use crate::model::ProviderReplayState;
+
+    #[tokio::test]
+    async fn http_cache_keys_and_terminal_only_text_items() {
+        use crate::config::ProviderKind;
+        use crate::model::{ModelRequest, ModelSpec, PromptSpec};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for kind in [ProviderKind::OpenAiChat, ProviderKind::OpenAiResponses] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let response_kind = kind.clone();
+            let task = tokio::spawn(async move {
+                let mut bodies = Vec::new();
+                for _ in 0..4 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut bytes = Vec::new();
+                    let (header_end, length) = loop {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(n, 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                        if let Some(end) = bytes.windows(4).position(|b| b == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap();
+                            break (end + 4, length);
+                        }
+                    };
+                    while bytes.len() < header_end + length {
+                        let mut buffer = [0; 4096];
+                        let n = socket.read(&mut buffer).await.unwrap();
+                        assert_ne!(n, 0);
+                        bytes.extend_from_slice(&buffer[..n]);
+                    }
+                    bodies.push(
+                        serde_json::from_slice::<Value>(&bytes[header_end..header_end + length])
+                            .unwrap(),
+                    );
+                    let body = if matches!(response_kind, ProviderKind::OpenAiResponses) {
+                        concat!(
+                            "data: {\"type\":\"response.output_item.done\",\"output_index\":0,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"first\"}]}}\n\n",
+                            "data: {\"type\":\"response.output_item.done\",\"output_index\":2,\"item\":{\"type\":\"message\",\"content\":[{\"type\":\"output_text\",\"text\":\"second\"}]}}\n\n",
+                            "data: {\"type\":\"response.completed\",\"response\":{}}\n\n"
+                        )
+                    } else {
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"firstsecond\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body);
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+                bodies
+            });
+            let config = ProviderConfig {
+                kind,
+                request_url: url,
+                api_key: "test".into(),
+                custom_headers: Default::default(),
+                max_output_tokens: None,
+                request_timeout: std::time::Duration::from_secs(5),
+                allowed_body_fields: None,
+            };
+            let provider = super::super::router::build(&config).unwrap();
+            for (i, (conversation, enabled)) in
+                [("a", true), ("a", true), ("b", true), ("test", false)]
+                    .into_iter()
+                    .enumerate()
+            {
+                let invocation = ModelInvocation {
+                    call_id: format!("call-{i}"),
+                    run_id: "run".into(),
+                    conversation_id: conversation.into(),
+                    prompt_cache_enabled: enabled,
+                    provider_call_index: i as u64,
+                    request: ModelRequest {
+                        prompt: PromptSpec {
+                            instructions: String::new(),
+                            tools: vec![],
+                        },
+                        model: ModelSpec::new("gpt-test"),
+                        history: vec![],
+                    },
+                };
+                let mut stream =
+                    provider.stream(invocation, tokio_util::sync::CancellationToken::new());
+                let mut text = String::new();
+                while let Some(event) = stream.next().await {
+                    if let ModelEvent::TextDelta(delta) = event.unwrap() {
+                        text.push_str(&delta);
+                    }
+                }
+                assert_eq!(text, "firstsecond");
+            }
+            let bodies = task.await.unwrap();
+            assert_eq!(bodies[0]["prompt_cache_key"], "cursor:a");
+            assert_eq!(bodies[1]["prompt_cache_key"], bodies[0]["prompt_cache_key"]);
+            assert_eq!(bodies[2]["prompt_cache_key"], "cursor:b");
+            assert!(bodies[3].get("prompt_cache_key").is_none());
+        }
+    }
+
+    #[test]
+    fn text_reconciliation_is_scoped_to_each_output_item() {
+        let mut open = false;
+        let mut text = String::new();
+        let mut index = None;
+        enter_response_text_item(&json!({"output_index": 0}), &mut index, &mut text);
+        assert_eq!(
+            reconcile_response_text(&mut open, &mut text, "checking"),
+            vec![
+                ModelEvent::TextStart,
+                ModelEvent::TextDelta("checking".into())
+            ]
+        );
+        open = false;
+        enter_response_text_item(&json!({"output_index": 2}), &mut index, &mut text);
+        assert_eq!(
+            reconcile_response_text(&mut open, &mut text, "looks fine"),
+            vec![
+                ModelEvent::TextStart,
+                ModelEvent::TextDelta("looks fine".into())
+            ]
+        );
+        enter_response_text_item(&json!({"output_index": 2}), &mut index, &mut text);
+        assert!(reconcile_response_text(&mut open, &mut text, "looks fine").is_empty());
+    }
+
+    #[test]
+    fn later_item_repairs_partial_deltas_and_missing_index_keeps_scope() {
+        let mut open = true;
+        let mut text = "previous item".to_string();
+        let mut index = Some(0);
+        enter_response_text_item(&json!({"output_index": 3}), &mut index, &mut text);
+        text.push_str("the file ");
+        enter_response_text_item(&json!({}), &mut index, &mut text);
+        assert_eq!(
+            reconcile_response_text(&mut open, &mut text, "the file looks fine"),
+            vec![ModelEvent::TextDelta("looks fine".into())]
+        );
+        assert_eq!(index, Some(3));
+    }
 
     #[test]
     fn reasoning_replay_projects_response_items_to_valid_input_items() {

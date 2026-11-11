@@ -389,6 +389,18 @@ async fn bidi_handler(
         true
     } else if registry.upstream(&decoded.request_id).await {
         false
+    } else if decoded.seqno > 0 {
+        let route = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            registry.wait_route(&decoded.request_id),
+        )
+        .await
+        .map_err(|_| {
+            crate::Error::Protocol(
+                "timed out waiting for the initial BidiAppend model selection".into(),
+            )
+        })?;
+        matches!(route, crate::cursor::transport::TransportRoute::Local)
     } else {
         trace.resume();
         trace.request(

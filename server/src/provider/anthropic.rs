@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    attempt::{send_once, Attempt},
+    attempt::{send_with_retry as send_once, Attempt},
     map_sse_error, merge_extra_params, provider_event_error,
     recorder::recorded_headers,
     CallRecorder, FinishReason, ModelEvent, Provider, ProviderStream,
@@ -119,6 +119,7 @@ impl Provider for AnthropicProvider {
             let mut thinking_signatures = std::collections::HashMap::<usize, String>::new();
             let mut thinking_blocks = Vec::new();
             let mut finish = None;
+            let mut refused = false;
             let mut saw_tool = false;
             let mut terminal = false;
             let mut final_usage = None::<Usage>;
@@ -211,7 +212,9 @@ impl Provider for AnthropicProvider {
                         if let Some(usage) = value.get("usage") {
                             merge_usage(final_usage.get_or_insert_default(), anthropic_usage(usage));
                         }
-                        finish = match value.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                        let stop_reason = value.pointer("/delta/stop_reason").and_then(Value::as_str);
+                        refused |= stop_reason == Some("refusal");
+                        finish = match stop_reason {
                             Some("tool_use") => Some(FinishReason::ToolUse),
                             Some("max_tokens" | "model_context_window_exceeded") => Some(FinishReason::Length),
                             Some("end_turn" | "stop_sequence" | "pause_turn" | "refusal") => Some(FinishReason::Stop),
@@ -237,13 +240,7 @@ impl Provider for AnthropicProvider {
                         if let Some(usage) = final_usage {
                             yield ModelEvent::Usage(usage);
                         }
-                        let finish = match finish {
-                            Some(FinishReason::Length) => FinishReason::Length,
-                            _ if saw_tool => FinishReason::ToolUse,
-                            Some(finish) => finish,
-                            None => FinishReason::Stop,
-                        };
-                        yield ModelEvent::Done(finish);
+                        yield ModelEvent::Done(collapse_anthropic_finish(finish, saw_tool, refused));
                     }
                     _ => {}
                 }
@@ -262,13 +259,7 @@ impl Provider for AnthropicProvider {
                 }
                 if let Some(usage) = final_usage { yield ModelEvent::Usage(usage); }
                 terminal = true;
-                let finish = match finish {
-                    Some(FinishReason::Length) => FinishReason::Length,
-                    _ if saw_tool => FinishReason::ToolUse,
-                    Some(finish) => finish,
-                    None => FinishReason::Stop,
-                };
-                yield ModelEvent::Done(finish);
+                yield ModelEvent::Done(collapse_anthropic_finish(finish, saw_tool, refused));
             }
             if !terminal {
                 Err(Error::Provider("Anthropic stream ended without message_stop".into()))?;
@@ -507,9 +498,47 @@ pub(crate) fn anthropic_usage(value: &Value) -> Usage {
     }
 }
 
+fn collapse_anthropic_finish(
+    finish: Option<FinishReason>,
+    saw_tool: bool,
+    refused: bool,
+) -> FinishReason {
+    match finish {
+        Some(FinishReason::Length) => FinishReason::Length,
+        _ if refused => FinishReason::Stop,
+        _ if saw_tool => FinishReason::ToolUse,
+        Some(finish) => finish,
+        None => FinishReason::Stop,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refusal_overrides_tools_but_not_truncation() {
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Stop), true, true),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            collapse_anthropic_finish(None, true, true),
+            FinishReason::Stop
+        );
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Stop), true, false),
+            FinishReason::ToolUse
+        );
+        assert_eq!(
+            collapse_anthropic_finish(Some(FinishReason::Length), true, true),
+            FinishReason::Length
+        );
+        assert_eq!(
+            collapse_anthropic_finish(None, false, false),
+            FinishReason::Stop
+        );
+    }
 
     #[test]
     fn cached_tokens_are_included_once_in_anthropic_context_input() {

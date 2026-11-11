@@ -3,7 +3,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 use hudsucker::{
     certificate_authority::RcgenAuthority,
-    hyper::{Request, Uri},
+    hyper::{Method, Request, Uri},
     rustls::crypto::aws_lc_rs,
     Body, HttpContext, HttpHandler, Proxy, RequestOrResponse,
 };
@@ -113,8 +113,10 @@ impl HttpHandler for CursorRelay {
         mut request: Request<Body>,
     ) -> RequestOrResponse {
         let original = request.uri().clone();
-        let locally_routed = should_route_locally(original.path(), *self.tab_mode.read());
-        if is_cursor_host(original.host().unwrap_or_default()) && locally_routed {
+        if request.method() != Method::CONNECT
+            && is_cursor_host(original.host().unwrap_or_default())
+            && should_route_locally(original.path(), *self.tab_mode.read())
+        {
             if let Ok(value) = original.to_string().parse() {
                 request.headers_mut().insert(UPSTREAM_URL_HEADER, value);
             }
@@ -193,12 +195,19 @@ fn is_local_path(path: &str) -> bool {
 }
 
 fn should_route_locally(path: &str, tab_mode: TabMode) -> bool {
-    is_local_path(path) || (is_tab_path(path) && tab_mode != TabMode::Direct)
+    is_local_path(path) || !is_tab_path(path) || tab_mode != TabMode::Direct
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmatched_cursor_paths_use_backend_and_tab_direct_is_preserved() {
+        assert!(should_route_locally("/unknown/service", TabMode::Direct));
+        assert!(is_cursor_host("API2.CURSOR.SH."));
+        assert!(!is_cursor_host("cursor.sh.example.com"));
+    }
 
     #[test]
     fn cursor_cli_transport_and_model_metadata_routes_stay_local() {

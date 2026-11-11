@@ -135,7 +135,18 @@ fn apply_body_allowlist(
     Ok(())
 }
 
-fn apply_openai_prompt_cache_key(body: &mut serde_json::Value, model_id: &str) -> Result<()> {
+fn apply_openai_prompt_cache_key(
+    body: &mut serde_json::Value,
+    model_id: &str,
+    cache_key: Option<&str>,
+) -> Result<()> {
+    let object = body
+        .as_object_mut()
+        .ok_or_else(|| crate::Error::Provider("provider request body must be an object".into()))?;
+    let Some(cache_key) = cache_key else {
+        object.remove("prompt_cache_key");
+        return Ok(());
+    };
     if !model_id.to_ascii_lowercase().contains("gpt") {
         return Ok(());
     }
@@ -143,7 +154,7 @@ fn apply_openai_prompt_cache_key(body: &mut serde_json::Value, model_id: &str) -
         .ok_or_else(|| crate::Error::Provider("provider request body must be an object".into()))?
         .insert(
             "prompt_cache_key".into(),
-            serde_json::Value::String("cursor-byok".into()),
+            serde_json::Value::String(cache_key.into()),
         );
     Ok(())
 }
@@ -151,6 +162,23 @@ fn apply_openai_prompt_cache_key(body: &mut serde_json::Value, model_id: &str) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_key_is_scoped_and_disabled_tests_remove_extra_param_override() {
+        for model in ["gpt-test", "other-model"] {
+            let mut body = serde_json::json!({"prompt_cache_key": "shared"});
+            apply_openai_prompt_cache_key(&mut body, model, None).unwrap();
+            assert!(body.get("prompt_cache_key").is_none());
+        }
+        let mut body = serde_json::json!({});
+        apply_openai_prompt_cache_key(&mut body, "gpt-test", Some("cursor:a")).unwrap();
+        assert_eq!(body["prompt_cache_key"], "cursor:a");
+        apply_openai_prompt_cache_key(&mut body, "gpt-test", Some("cursor:b")).unwrap();
+        assert_eq!(body["prompt_cache_key"], "cursor:b");
+        let mut body = serde_json::json!({});
+        apply_openai_prompt_cache_key(&mut body, "other-model", Some("cursor:a")).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
 
     #[test]
     fn sse_transport_errors_are_not_relabelled_as_parse_errors() {

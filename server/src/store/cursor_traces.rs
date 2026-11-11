@@ -72,8 +72,8 @@ impl Store {
     ) -> Result<()> {
         let metadata_json = serde_json::to_string(metadata)?;
         let blob_id = BlobId::digest(data);
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         Self::put_blob_tx(&mut tx, &blob_id, data, &[]).await?;
         Self::link_cursor_trace_artifact_tx(
             &mut tx,
@@ -93,6 +93,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        session.committed();
         Ok(())
     }
 
@@ -106,8 +107,8 @@ impl Store {
     ) -> Result<()> {
         let metadata_json = serde_json::to_string(metadata)?;
         let blob_id = BlobId::digest(data);
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         Self::put_blob_tx(&mut tx, &blob_id, data, &[]).await?;
         Self::link_cursor_trace_artifact_tx(
             &mut tx,
@@ -119,6 +120,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        session.committed();
         Ok(())
     }
 
@@ -131,8 +133,8 @@ impl Store {
         metadata: &serde_json::Value,
     ) -> Result<()> {
         let metadata_json = serde_json::to_string(metadata)?;
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         Self::link_cursor_trace_artifact_tx(
             &mut tx,
             request_id,
@@ -143,6 +145,7 @@ impl Store {
         )
         .await?;
         tx.commit().await?;
+        session.committed();
         Ok(())
     }
 
@@ -218,8 +221,8 @@ impl Store {
             return Ok(());
         }
         let response_bytes = chunks.iter().map(|chunk| chunk.data.len()).sum::<usize>();
-        let _write = self.writes.lock().await;
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         for chunk in chunks {
             let metadata_json =
                 serde_json::to_string(&serde_json::json!({"byte_count": chunk.data.len()}))?;
@@ -249,6 +252,7 @@ impl Store {
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
+        session.committed();
         Ok(())
     }
 

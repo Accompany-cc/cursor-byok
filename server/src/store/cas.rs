@@ -45,11 +45,12 @@ pub struct BlobEdge {
 
 impl Store {
     pub async fn put_blob(&self, data: &[u8], edges: &[BlobEdge]) -> Result<BlobId> {
-        let _write = self.writes.lock().await;
         let blob_id = BlobId::digest(data);
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut session = self.write_session().await?;
+        let mut tx = session.begin().await?;
         Self::put_blob_tx(&mut tx, &blob_id, data, edges).await?;
         tx.commit().await?;
+        session.committed();
         Ok(blob_id)
     }
 

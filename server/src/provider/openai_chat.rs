@@ -18,7 +18,7 @@ use crate::{
 
 use super::{
     apply_body_allowlist, apply_openai_prompt_cache_key,
-    attempt::{send_once, Attempt},
+    attempt::{send_with_retry as send_once, Attempt},
     map_sse_error, merge_extra_params, provider_event_error,
     recorder::recorded_headers,
     CallRecorder, FinishReason, ModelEvent, Provider, ProviderStream,
@@ -64,6 +64,7 @@ impl Provider for OpenAiChatProvider {
         let config = self.config.clone();
         let recorder = self.recorder.clone();
         Box::pin(try_stream! {
+            let cache_key = invocation.cache_key();
             let ModelInvocation { call_id, request, .. } = invocation;
             tracing::debug!(
                 model = %request.model.model_id,
@@ -86,7 +87,7 @@ impl Provider for OpenAiChatProvider {
             }
             apply_model(&mut body, &request.model, config.max_output_tokens)?;
             merge_extra_params(&mut body, &request.model.extra_params)?;
-            apply_openai_prompt_cache_key(&mut body, &request.model.model_id)?;
+            apply_openai_prompt_cache_key(&mut body, &request.model.model_id, cache_key.as_deref())?;
             apply_body_allowlist(&mut body, config.allowed_body_fields.as_ref())?;
             let request_headers = recorded_headers(&config, &[("content-type", "application/json")]);
             if let Some(recorder) = &recorder {

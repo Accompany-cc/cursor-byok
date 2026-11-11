@@ -23,8 +23,21 @@ pub struct ModelInvocation {
     pub call_id: String,
     pub run_id: String,
     pub conversation_id: String,
+    #[serde(default = "prompt_cache_enabled_by_default")]
+    pub prompt_cache_enabled: bool,
     pub provider_call_index: u64,
     pub request: ModelRequest,
+}
+
+fn prompt_cache_enabled_by_default() -> bool {
+    true
+}
+
+impl ModelInvocation {
+    pub(crate) fn cache_key(&self) -> Option<String> {
+        self.prompt_cache_enabled
+            .then(|| format!("cursor:{}", self.conversation_id))
+    }
 }
 
 pub(crate) fn normalize_provider_tool_call_ids(history: &mut [ProjectedMessage]) {

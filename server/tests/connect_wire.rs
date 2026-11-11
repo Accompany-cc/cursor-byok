@@ -162,6 +162,58 @@ async fn bidi_append_accepts_the_binary_and_hex_forms_from_cursor() {
 }
 
 #[tokio::test]
+async fn later_append_waits_for_initial_route() {
+    let (_directory, store) = fixtures::temp_store().await;
+    let assets =
+        PromptAssets::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("prompt/cursor"))
+            .unwrap();
+    let clients = NetworkClients::new(store.clone());
+    let registry = TransportRegistry::new(
+        store,
+        Arc::new(fake_provider::FakeProvider::default()),
+        PromptCompiler::new(assets),
+    );
+    let router = cursor::router(registry.clone(), clients).unwrap();
+    let wire = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: "overtaking".into(),
+        }),
+        append_seqno: 1,
+        data_binary: pb::AgentClientMessage {
+            message: Some(pb::agent_client_message::Message::ClientHeartbeat(
+                pb::ClientHeartbeat {},
+            )),
+        }
+        .encode_to_vec(),
+        ..Default::default()
+    }
+    .encode_to_vec();
+    let task = tokio::spawn(async move {
+        router
+            .oneshot(
+                Request::post("/aiserver.v1.BidiService/BidiAppend")
+                    .header(header::CONTENT_TYPE, "application/proto")
+                    .body(Body::from(wire))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(
+        !task.is_finished(),
+        "a later append must wait rather than reject a missing model"
+    );
+    registry.get_or_create("overtaking").await.unwrap();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    registry.shutdown().await;
+}
+
+#[tokio::test]
 async fn bidi_append_gzip_body_is_decompressed_before_protobuf_decode() {
     let (_directory, store) = fixtures::temp_store().await;
     let assets = PromptAssets::load(
