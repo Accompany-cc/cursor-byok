@@ -24,7 +24,7 @@ mod context_tests {
         for model_id in ["plugin:test:model", "builtin-model"] {
             let mut input = pb::InferenceStreamRequest::default();
             assert_eq!(
-                project(&input, model_id)
+                project(&input, &ModelSpec::new(model_id))
                     .unwrap()
                     .model
                     .context_window_tokens,
@@ -39,14 +39,14 @@ mod context_tests {
                 ..Default::default()
             });
             assert_eq!(
-                project(&input, model_id)
+                project(&input, &ModelSpec::new(model_id))
                     .unwrap()
                     .model
                     .context_window_tokens,
                 Some(356_000)
             );
             input.requested_model.as_mut().unwrap().parameters[0].value = "invalid".into();
-            assert!(project(&input, model_id).is_err());
+            assert!(project(&input, &ModelSpec::new(model_id)).is_err());
         }
     }
 }
@@ -68,8 +68,27 @@ pub(crate) fn selected_context(model: Option<&pb::InferenceRequestedModel>) -> R
         })
 }
 
-pub(crate) fn project(input: &pb::InferenceStreamRequest, model_id: &str) -> Result<ModelRequest> {
-    let mut model = ModelSpec::new(model_id);
+pub(crate) fn apply_selection(
+    model: &mut ModelSpec,
+    selection: Option<&pb::InferenceRequestedModel>,
+) -> Result<()> {
+    if let Some(selection) = selection {
+        // max_mode is a non-optional protobuf bool: false cannot distinguish omission.
+        if selection.max_mode {
+            model.reasoning.enabled = true;
+        }
+        for parameter in &selection.parameters {
+            crate::cursor::compile::apply_model_parameter(model, &parameter.id, &parameter.value)?;
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn project(
+    input: &pb::InferenceStreamRequest,
+    selection: &ModelSpec,
+) -> Result<ModelRequest> {
+    let mut model = selection.clone();
     if let Some(config) = &input.model_config {
         model.max_output_tokens = config
             .max_tokens
@@ -86,16 +105,9 @@ pub(crate) fn project(input: &pb::InferenceStreamRequest, model_id: &str) -> Res
         }
         model.extra_params = Value::Object(extra);
     }
-    model.context_window_tokens = selected_context(input.requested_model.as_ref())?;
-    if let Some(requested) = &input.requested_model {
-        model.reasoning.enabled = requested.max_mode;
-        for parameter in &requested.parameters {
-            if matches!(parameter.id.as_str(), "effort" | "reasoning") {
-                model.reasoning.effort = Some(parameter.value.clone());
-                model.reasoning.enabled = true;
-            }
-        }
-    }
+    model.context_window_tokens =
+        selected_context(input.requested_model.as_ref())?.or(model.context_window_tokens);
+    apply_selection(&mut model, input.requested_model.as_ref())?;
 
     let tools = input
         .tools
@@ -294,15 +306,120 @@ mod tests {
     use super::*;
 
     #[test]
+    fn run_selection_reaches_plugin_wire_and_invocation_can_override_it() {
+        use crate::model::{ModelInvocation, ModelLatency};
+        let mut run = ModelSpec::new("plugin:test:model");
+        let selection = |parameters: &[(&str, &str)]| pb::InferenceRequestedModel {
+            parameters: parameters
+                .iter()
+                .map(|(id, value)| pb::InferenceModelParameterValue {
+                    id: (*id).into(),
+                    value: (*value).into(),
+                })
+                .collect(),
+            ..Default::default()
+        };
+        apply_selection(
+            &mut run,
+            Some(&selection(&[("effort", " high "), ("fast", "true")])),
+        )
+        .unwrap();
+        run.context_window_tokens = Some(256_000);
+        for requested_model in [None, Some(selection(&[]))] {
+            let request = project(
+                &pb::InferenceStreamRequest {
+                    requested_model,
+                    ..Default::default()
+                },
+                &run,
+            )
+            .unwrap();
+            assert_eq!(request.model.reasoning.effort.as_deref(), Some("high"));
+            assert!(request.model.reasoning.enabled);
+            assert_eq!(request.model.context_window_tokens, Some(256_000));
+            let wire = crate::plugin::llm_request(&ModelInvocation {
+                call_id: "call".into(),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: 0,
+                request,
+            })
+            .unwrap();
+            assert_eq!(
+                wire["reasoning"],
+                serde_json::json!({"enabled": true, "effort": "high"})
+            );
+            assert_eq!(wire["latency"], "fast");
+        }
+        for (params, expected, enabled) in [
+            (
+                vec![("reasoning", "low"), ("fast", "false")],
+                Some("low"),
+                true,
+            ),
+            (vec![("thinking", "false"), ("fast", "false")], None, false),
+            (vec![("effort", "none")], None, false),
+            (vec![("effort", " ")], None, false),
+            (vec![("thinking", "true")], Some("high"), true),
+        ] {
+            let request = project(
+                &pb::InferenceStreamRequest {
+                    requested_model: Some(selection(&params)),
+                    ..Default::default()
+                },
+                &run,
+            )
+            .unwrap();
+            assert_eq!(request.model.reasoning.effort.as_deref(), expected);
+            assert_eq!(request.model.reasoning.enabled, enabled);
+            assert!(request.model.reasoning.explicit);
+            if params
+                .iter()
+                .any(|(id, value)| *id == "fast" && *value == "false")
+            {
+                assert_eq!(request.model.latency, ModelLatency::Standard);
+            }
+        }
+    }
+
+    #[test]
+    fn selection_rejects_invalid_booleans_and_does_not_invent_effort() {
+        let mut model = ModelSpec::new("test");
+        apply_selection(
+            &mut model,
+            Some(&pb::InferenceRequestedModel {
+                max_mode: true,
+                ..Default::default()
+            }),
+        )
+        .unwrap();
+        assert!(model.reasoning.enabled);
+        assert_eq!(model.reasoning.effort, None);
+        for id in ["fast", "thinking"] {
+            assert!(apply_selection(
+                &mut model,
+                Some(&pb::InferenceRequestedModel {
+                    parameters: vec![pb::InferenceModelParameterValue {
+                        id: id.into(),
+                        value: "invalid".into()
+                    }],
+                    ..Default::default()
+                })
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
     fn unchanged_client_history_remains_an_exact_provider_prefix() {
         let mut input = pb::InferenceStreamRequest {
             messages: vec![text(4, "You are an assistant"), text(1, "First question")],
             ..Default::default()
         };
-        let first = project(&input, "test-model").unwrap();
+        let first = project(&input, &ModelSpec::new("test-model")).unwrap();
         input.messages.push(text(2, "First answer"));
         input.messages.push(text(1, "Second question"));
-        let second = project(&input, "test-model").unwrap();
+        let second = project(&input, &ModelSpec::new("test-model")).unwrap();
 
         assert_eq!(first.prompt.instructions, second.prompt.instructions);
         assert_eq!(first.history, second.history[..first.history.len()]);
@@ -338,7 +455,7 @@ mod tests {
             ..Default::default()
         };
 
-        let request = project(&input, "test-model").unwrap();
+        let request = project(&input, &ModelSpec::new("test-model")).unwrap();
         assert_eq!(
             request.prompt.tools[0].parameters,
             serde_json::json!({"type":"object"})
@@ -376,7 +493,7 @@ mod tests {
             ..Default::default()
         };
 
-        let request = project(&input, "test-model").unwrap();
+        let request = project(&input, &ModelSpec::new("test-model")).unwrap();
         let params = &request.prompt.tools[0].parameters;
 
         // Verify that minItems is an integer, not a float

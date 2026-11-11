@@ -134,13 +134,17 @@ async fn assert_client_loop(
                     conversation_id: "conversation-test".into(),
                     requested_model: Some(pb::InferenceRequestedModel {
                         model_id: model.model_hash.clone(),
-                        parameters: run_context
-                            .into_iter()
-                            .map(|value| pb::InferenceModelParameterValue {
+                        parameters: std::iter::once(pb::InferenceModelParameterValue {
+                            id: "effort".into(),
+                            value: "high".into(),
+                        })
+                        .chain(run_context.into_iter().map(|value| {
+                            pb::InferenceModelParameterValue {
                                 id: "context".into(),
                                 value: value.into(),
-                            })
-                            .collect(),
+                            }
+                        }))
+                        .collect(),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -308,6 +312,8 @@ async fn assert_client_loop(
         requests[0].model.context_window_tokens,
         Some(expected_context as u64)
     );
+    assert_eq!(requests[0].model.reasoning.effort.as_deref(), Some("high"));
+    assert!(requests[0].model.reasoning.enabled);
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].history.len(), 1);
     assert_eq!(requests[0].prompt.tools[0].name, "Read");

@@ -13,6 +13,8 @@ mod registry;
 mod runtime;
 mod state;
 mod wire;
+#[cfg(test)]
+pub(crate) use wire::llm_request;
 mod worker;
 
 pub use descriptor::{

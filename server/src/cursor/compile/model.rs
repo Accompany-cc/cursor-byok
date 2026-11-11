@@ -24,6 +24,7 @@ pub fn requested_model(request: &pb::AgentRunRequest) -> Result<ModelSpec> {
             reasoning: ReasoningSpec {
                 enabled: details.is_some_and(|model| model.thinking_details.is_some()),
                 effort: None,
+                explicit: false,
             },
             latency: ModelLatency::Standard,
             max_output_tokens: None,
@@ -89,6 +90,7 @@ fn from_requested(
             enabled: model.max_mode
                 || details.is_some_and(|model| model.thinking_details.is_some()),
             effort: None,
+            explicit: false,
         },
         latency: ModelLatency::Standard,
         max_output_tokens: None,
@@ -98,17 +100,8 @@ fn from_requested(
     };
     for parameter in &model.parameters {
         match parameter.id.as_str() {
-            "effort" | "reasoning" => {
-                let effort = parameter.value.trim();
-                spec.reasoning.effort =
-                    (effort != "none" && !effort.is_empty()).then(|| effort.to_string());
-                spec.reasoning.enabled |= spec.reasoning.effort.is_some();
-            }
-            "thinking" => spec.reasoning.enabled |= parse_bool(parameter)?,
-            "fast" => {
-                if parse_bool(parameter)? {
-                    spec.latency = ModelLatency::Fast;
-                }
+            "effort" | "reasoning" | "thinking" | "fast" => {
+                apply_model_parameter(&mut spec, &parameter.id, &parameter.value)?;
             }
             "context" => {
                 spec.context_window_tokens =
@@ -125,13 +118,40 @@ fn from_requested(
     Ok(spec)
 }
 
-fn parse_bool(parameter: &pb::requested_model::ModelParameterValue) -> Result<bool> {
-    match parameter.value.as_str() {
+pub(crate) fn apply_model_parameter(spec: &mut ModelSpec, id: &str, value: &str) -> Result<()> {
+    match id {
+        "effort" | "reasoning" => {
+            let effort = value.trim();
+            spec.reasoning.effort =
+                (!effort.is_empty() && effort != "none").then(|| effort.to_string());
+            spec.reasoning.enabled = spec.reasoning.effort.is_some();
+            spec.reasoning.explicit = true;
+        }
+        "thinking" => {
+            spec.reasoning.enabled = parse_bool(id, value)?;
+            spec.reasoning.explicit = true;
+            if !spec.reasoning.enabled {
+                spec.reasoning.effort = None;
+            }
+        }
+        "fast" => {
+            spec.latency = if parse_bool(id, value)? {
+                ModelLatency::Fast
+            } else {
+                ModelLatency::Standard
+            };
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn parse_bool(id: &str, value: &str) -> Result<bool> {
+    match value {
         "true" => Ok(true),
         "false" => Ok(false),
         _ => Err(Error::Protocol(format!(
-            "invalid Cursor boolean model parameter {}={}",
-            parameter.id, parameter.value
+            "invalid Cursor boolean model parameter {id}={value}"
         ))),
     }
 }

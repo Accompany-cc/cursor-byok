@@ -88,7 +88,7 @@ impl Provider for ProviderRouter {
                             &invocation.conversation_id,
                         );
                     routed.request.model.model_id = model.model_id.clone();
-                    let recorder = start_recorder(&store, &invocation, &model.model_hash, &model.display_name, provider_type, &request_url, &model.model_id).await?;
+                    let recorder = start_recorder(&store, &routed, &model.model_hash, &model.display_name, provider_type, &request_url, &model.model_id).await?;
                     let guard = recorder.cancel_on_drop();
                     let config = ProviderConfig {
                         kind: provider_kind(provider_type),
@@ -372,6 +372,73 @@ fn build_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_precedence_plugin_wire_and_recording_agree() {
+        use crate::model::{ModelConfigInput, ModelRequest, ModelSpec, ModelType};
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::connect(&format!(
+            "sqlite://{}",
+            directory.path().join("test.db").display()
+        ))
+        .await
+        .unwrap();
+        let input: ModelConfigInput = serde_json::from_value(serde_json::json!({
+            "display_name": "Test", "type": "openai", "base_url": "https://example.com/v1",
+            "api_key": "test", "tooltip_data": "test", "model_id": "test",
+            "reasoning_effort": "medium", "context_window_tokens": 1_000_000
+        }))
+        .unwrap();
+        let config = store.create_model(&input).await.unwrap();
+        for (index, parameters, effort, enabled) in [
+            (0, vec![], Some("medium"), true),
+            (1, vec![("effort", "high")], Some("high"), true),
+            (2, vec![("thinking", "false")], None, false),
+            (3, vec![("reasoning", "none")], None, false),
+        ] {
+            let mut model = ModelSpec::new(&config.model_hash);
+            model.context_window_tokens = Some(256_000);
+            for (id, value) in parameters {
+                crate::cursor::compile::apply_model_parameter(&mut model, id, value).unwrap();
+            }
+            config.configure(&mut model);
+            assert_eq!(model.reasoning.effort.as_deref(), effort);
+            assert_eq!(model.reasoning.enabled, enabled);
+            assert_eq!(model.context_window_tokens, Some(256_000));
+            let invocation = ModelInvocation {
+                call_id: format!("call-{index}"),
+                run_id: "run".into(),
+                conversation_id: "conversation".into(),
+                provider_call_index: index,
+                request: ModelRequest {
+                    model,
+                    prompt: crate::model::PromptSpec {
+                        instructions: String::new(),
+                        tools: vec![],
+                    },
+                    history: vec![],
+                },
+            };
+            let wire = crate::plugin::llm_request(&invocation).unwrap();
+            assert_eq!(wire["reasoning"]["effort"], serde_json::json!(effort));
+            assert_eq!(wire["reasoning"]["enabled"], enabled);
+            let recorder = start_recorder(
+                &store,
+                &invocation,
+                &config.model_hash,
+                "Test",
+                config.provider_type(),
+                "https://example.com",
+                "test",
+            )
+            .await
+            .unwrap();
+            recorder.cancelled().await.unwrap();
+            let call = store.llm_call(&invocation.call_id).await.unwrap().unwrap();
+            assert_eq!(call.reasoning_effort.as_deref(), effort);
+        }
+        assert_eq!(config.model_type, ModelType::OpenAi);
+    }
 
     #[test]
     fn renders_cursor_conversation_id_in_custom_header_values() {

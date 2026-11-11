@@ -16,7 +16,7 @@ use crate::{
         protocol::{connect, proto::inference as pb},
         transport::{OutputHub, TransportRegistry},
     },
-    model::{ModelInvocation, ModelType},
+    model::{ModelInvocation, ModelSpec, ModelType},
     provider::{ModelEvent, Provider},
     Error, Result,
 };
@@ -97,6 +97,9 @@ impl InferenceService {
                     .as_ref()
                     .and_then(|model| model.context_window_tokens)
             });
+        let mut selection = ModelSpec::new(model_id);
+        selection.context_window_tokens = context_window;
+        super::project::apply_selection(&mut selection, request.requested_model.as_ref())?;
         let local = configured.is_some() || model_id.starts_with(crate::plugin::ADAPTER_ID_PREFIX);
         let route = if local {
             tracing::info!(
@@ -117,7 +120,7 @@ impl InferenceService {
                 self.registry.provider(),
                 request_id.into(),
                 request.conversation_id.clone(),
-                (model_id.into(), context_window),
+                selection,
                 configured.map(|model| (model.display_name, model.model_type)),
             ));
             InferenceRoute::Local(run)
@@ -175,10 +178,9 @@ async fn serve(
     provider: Arc<dyn Provider>,
     run_id: String,
     conversation_id: String,
-    model_selection: (String, Option<u64>),
+    model_selection: ModelSpec,
     model_info: Option<(String, ModelType)>,
 ) {
-    let (model_id, context_window) = model_selection;
     let invocations = Arc::new(Mutex::new(HashMap::<String, CancellationToken>::new()));
     let mut tasks = JoinSet::new();
     let mut finished = false;
@@ -207,15 +209,13 @@ async fn serve(
                     );
                     continue;
                 }
-                let mut request = match project(&request, &model_id) {
+                let request = match project(&request, &model_selection) {
                     Ok(request) => request,
                     Err(error) => {
                         invocation_error(&output, id, &error.to_string());
                         continue;
                     }
                 };
-                request.model.context_window_tokens =
-                    request.model.context_window_tokens.or(context_window);
                 let cancellation = CancellationToken::new();
                 invocations.lock().insert(id.clone(), cancellation.clone());
                 tasks.spawn(serve_invocation(
