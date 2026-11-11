@@ -1,0 +1,51 @@
+name: Windows test build (manual)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Windows x64 NSIS installer
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      # With no ref override, checkout builds the ref selected for workflow_dispatch.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: ". -> target"
+          key: windows-x86_64-test
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+
+      - name: Test Cursor protocol regressions on Windows
+        run: cargo test --locked --package cursor-server --lib api::cursor
+
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+
+      # Runtime update entry points are disabled; this config also disables
+      # updater artifacts so no signing secrets are needed.
+      - name: Build installer without updater signing
+        working-directory: apps/desktop
+        run: npm run tauri:build -- --target x86_64-pc-windows-msvc --bundles nsis --config windows-test.config.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cursor-byok-windows-x64-test-${{ github.sha }}
+          path: target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe
+          if-no-files-found: error
+          retention-days: 14

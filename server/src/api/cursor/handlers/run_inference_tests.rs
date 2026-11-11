@@ -1,4 +1,4 @@
-//! Exercises the client-owned Agent inference handshake and model stream.
+//! Exercises Bidi encodings across Agent and client-owned inference streams.
 use std::sync::{Arc, Mutex};
 
 use super::{router_with_proxy, CursorProxy};
@@ -31,6 +31,15 @@ use tower::ServiceExt;
 
 #[tokio::test]
 async fn client_loop_receives_ready_text_tool_call_and_completion() {
+    assert_client_loop(false).await;
+}
+
+#[tokio::test]
+async fn binary_client_loop_receives_ready_text_tool_call_and_completion() {
+    assert_client_loop(true).await;
+}
+
+async fn assert_client_loop(binary: bool) {
     let (_directory, store) = temp_store().await;
     let model = store.create_model(&model_input()).await.unwrap();
     let provider = FakeProvider::default();
@@ -59,6 +68,39 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
     ]);
     let (_router_directory, router) = router(store, provider.clone());
     let request_id = "inference-test";
+    let ambiguous_payload = pb::RunInferenceClientMessage {
+        message: Some(pb::run_inference_client_message::Message::RunRequest(
+            pb::RunInferenceRunRequest {
+                conversation_id: "conversation-test".into(),
+                requested_model: Some(pb::InferenceRequestedModel {
+                    model_id: model.model_hash.clone(),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        )),
+    }
+    .encode_to_vec();
+    let ambiguous = ai::BidiAppendRequest {
+        request_id: Some(ai::BidiRequestId {
+            request_id: request_id.into(),
+        }),
+        data: hex::encode(&ambiguous_payload),
+        data_binary: ambiguous_payload,
+        ..Default::default()
+    };
+    let rejected = router
+        .clone()
+        .oneshot(
+            Request::post("/aiserver.v1.BidiService/BidiAppend")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(ambiguous.encode_to_vec()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+    assert!(provider.requests().is_empty());
     append(
         &router,
         request_id,
@@ -75,6 +117,7 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
                 },
             )),
         },
+        binary,
     )
     .await;
     let response = router
@@ -99,7 +142,46 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
         panic!("expected run_ready");
     };
     assert_eq!(ready.resolved_model.unwrap().model_id, model.model_hash);
-    assert!(!ready.prompt_model_metadata.unwrap().is_gpt5);
+    let metadata = ready.prompt_model_metadata.unwrap();
+    assert!(!metadata.is_gpt5);
+    let modes: Vec<&str> = metadata
+        .agent_mode_configs
+        .iter()
+        .map(|config| config.mode_id.as_str())
+        .collect();
+    assert_eq!(
+        modes,
+        ["agent", "chat", "plan", "debug", "triage", "multitask"]
+    );
+    assert!(metadata
+        .agent_mode_configs
+        .iter()
+        .all(|config| config.enable_ask_question_tool));
+    let agent = metadata
+        .agent_mode_configs
+        .iter()
+        .find(|config| config.mode_id == "agent")
+        .unwrap();
+    let switch_targets = agent.switch_mode_tool_config.as_ref().map(|config| {
+        config
+            .target_modes
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(
+        switch_targets,
+        Some(vec!["agent", "chat", "plan", "debug", "multitask"])
+    );
+    assert!(metadata
+        .agent_mode_configs
+        .iter()
+        .filter(|config| config.mode_id != "agent")
+        .all(|config| config.switch_mode_tool_config.is_none()));
+    assert_eq!(
+        metadata.ask_question_config.unwrap().tool_name,
+        "AskQuestion"
+    );
 
     append(
         &router,
@@ -128,6 +210,7 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
                 },
             )),
         },
+        binary,
     )
     .await;
 
@@ -188,9 +271,13 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
         2,
         pb::RunInferenceClientMessage {
             message: Some(pb::run_inference_client_message::Message::FinishRun(
-                pb::RunInferenceFinishRun { aborted: false },
+                pb::RunInferenceFinishRun {
+                    aborted: false,
+                    ..Default::default()
+                },
             )),
         },
+        binary,
     )
     .await;
     let end = tokio::time::timeout(std::time::Duration::from_secs(3), stream.next())
@@ -204,19 +291,190 @@ async fn client_loop_receives_ready_text_tool_call_and_completion() {
     );
 }
 
+#[tokio::test]
+async fn binary_agent_run_reaches_the_provider() {
+    assert_agent_run(true).await;
+}
+
+#[tokio::test]
+async fn hex_agent_run_still_reaches_the_provider() {
+    assert_agent_run(false).await;
+}
+
+async fn assert_agent_run(binary: bool) {
+    let (_directory, store) = temp_store().await;
+    let model = store.create_model(&model_input()).await.unwrap();
+    let provider = FakeProvider::default();
+    provider.push(vec![
+        ModelEvent::Start {
+            model_call_id: "agent-call".into(),
+        },
+        ModelEvent::TextStart,
+        ModelEvent::TextDelta("binary-compatible answer".into()),
+        ModelEvent::TextEnd,
+        ModelEvent::Done(FinishReason::Stop),
+    ]);
+    let (_router_directory, router) = router(store, provider.clone());
+    let request_id = "agent-encoding-test";
+    append(
+        &router,
+        request_id,
+        0,
+        agent::AgentClientMessage {
+            message: Some(agent::agent_client_message::Message::RunRequest(
+                agent::AgentRunRequest {
+                    conversation_id: Some("agent-encoding-conversation".into()),
+                    requested_model: Some(agent::RequestedModel {
+                        model_id: model.model_hash,
+                        ..Default::default()
+                    }),
+                    action: Some(agent::ConversationAction {
+                        action: Some(agent::conversation_action::Action::UserMessageAction(
+                            agent::UserMessageAction {
+                                user_message: Some(agent::UserMessage {
+                                    text: "verify binary agent input".into(),
+                                    message_id: "encoding-user".into(),
+                                    mode: agent::AgentMode::Agent as i32,
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        )),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+            )),
+        },
+        binary,
+    )
+    .await;
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/agent.v1.AgentService/RunSSE")
+                .header(header::CONTENT_TYPE, "application/proto")
+                .body(Body::from(
+                    connect::encode_message(&agent::BidiRequestId {
+                        request_id: request_id.into(),
+                    })
+                    .unwrap(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let mut stream = response.into_body().into_data_stream();
+    let mut seqno = 1;
+    loop {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(5), stream.next())
+            .await
+            .expect("Agent stream timed out")
+            .expect("Agent stream ended")
+            .unwrap();
+        let (flags, payload) = connect::decode_frames(&frame).unwrap().pop().unwrap();
+        assert_eq!(
+            flags,
+            0,
+            "Agent run failed: {}",
+            String::from_utf8_lossy(&payload)
+        );
+        let message = agent::AgentServerMessage::decode(payload).unwrap();
+        match message.message {
+            Some(agent::agent_server_message::Message::KvServerMessage(kv)) => {
+                append(
+                    &router,
+                    request_id,
+                    seqno,
+                    agent::AgentClientMessage {
+                        message: Some(agent::agent_client_message::Message::KvClientMessage(
+                            agent::KvClientMessage {
+                                id: kv.id,
+                                message: Some(agent::kv_client_message::Message::SetBlobResult(
+                                    agent::SetBlobResult { error: None },
+                                )),
+                            },
+                        )),
+                    },
+                    binary,
+                )
+                .await;
+                seqno += 1;
+            }
+            Some(agent::agent_server_message::Message::InteractionUpdate(update))
+                if matches!(
+                    update.message,
+                    Some(agent::interaction_update::Message::TurnEnded(_))
+                ) =>
+            {
+                break
+            }
+            _ => {}
+        }
+    }
+    let requests = provider.requests();
+    assert_eq!(requests.len(), 1);
+    assert!(serde_json::to_string(&requests[0].history)
+        .unwrap()
+        .contains("verify binary agent input"));
+}
+
+#[tokio::test]
+async fn invalid_bidi_payloads_return_bad_request_without_invoking_a_provider() {
+    let (_directory, store) = temp_store().await;
+    let provider = FakeProvider::default();
+    let (_router_directory, router) = router(store, provider.clone());
+    for (data, data_binary) in [
+        (String::new(), Vec::new()),
+        ("not hexadecimal".into(), Vec::new()),
+        (String::new(), vec![0x0a]),
+        ("0a".into(), vec![0x0a]),
+        ("not hexadecimal".into(), vec![0x0a]),
+    ] {
+        let request = ai::BidiAppendRequest {
+            request_id: Some(ai::BidiRequestId {
+                request_id: "bad-input".into(),
+            }),
+            data,
+            data_binary,
+            ..Default::default()
+        };
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post("/aiserver.v1.BidiService/BidiAppend")
+                    .header(header::CONTENT_TYPE, "application/proto")
+                    .body(Body::from(request.encode_to_vec()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+    assert!(provider.requests().is_empty());
+}
+
 async fn append(
     router: &axum::Router,
     request_id: &str,
     seqno: i64,
-    message: pb::RunInferenceClientMessage,
+    message: impl Message,
+    binary: bool,
 ) {
+    let payload = message.encode_to_vec();
+    assert!(!payload.is_empty(), "fixture must encode a real message");
     let request = ai::BidiAppendRequest {
         request_id: Some(ai::BidiRequestId {
             request_id: request_id.into(),
         }),
-        data: hex::encode(message.encode_to_vec()),
+        data: if binary {
+            String::new()
+        } else {
+            hex::encode(&payload)
+        },
+        data_binary: if binary { payload } else { Vec::new() },
         append_seqno: seqno,
-        ..Default::default()
     };
     let response = router
         .clone()

@@ -20,6 +20,7 @@ concurrency:
 
 jobs:
   prepare:
+    if: github.repository == 'Accompany-cc/cursor-byok' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
     name: Prepare release
     runs-on: ubuntu-24.04
     timeout-minutes: 10
@@ -40,16 +41,6 @@ jobs:
         run: |
           if [[ "${GITHUB_ACTOR}" != "${REPOSITORY_OWNER}" || "${GITHUB_TRIGGERING_ACTOR}" != "${REPOSITORY_OWNER}" ]]; then
             echo "Only ${REPOSITORY_OWNER} may publish a release" >&2
-            exit 1
-          fi
-
-      - name: Verify updater signing key
-        env:
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-        shell: bash
-        run: |
-          if [[ -z "${TAURI_SIGNING_PRIVATE_KEY}" ]]; then
-            echo "TAURI_SIGNING_PRIVATE_KEY is not configured" >&2
             exit 1
           fi
 
@@ -158,8 +149,6 @@ jobs:
       - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ contains(matrix.platform, 'macos') && '-' || '' }}
         with:
           projectPath: apps/desktop
@@ -169,7 +158,7 @@ jobs:
           releaseDraft: true
           prerelease: false
           generateReleaseNotes: true
-          uploadUpdaterJson: true
+          uploadUpdaterJson: false
           args: ${{ matrix.args }}
 
       # Tauri builds macOS DMGs, but tauri-action uploads only updater bundles.
@@ -202,24 +191,15 @@ jobs:
           cp "${dmgs[0]}" "${installer}"
           gh release upload "v${VERSION}" "${installer}" --clobber
 
-      - name: Package and sign Windows portable update
+      - name: Package Windows portable app
         if: matrix.platform == 'windows-x86_64'
         shell: pwsh
         env:
           VERSION: ${{ needs.prepare.outputs.version }}
-          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
-          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           New-Item -ItemType Directory -Force portable-update | Out-Null
           $asset = "portable-update/cursor-byok-$env:VERSION-windows-amd64.zip"
           Compress-Archive -LiteralPath target/release/cursor-byok-desktop.exe,LICENSE,THIRD-PARTY-LICENSES.md -DestinationPath $asset
-          Push-Location apps/desktop
-          npm exec tauri signer sign -- "../../$asset"
-          Pop-Location
-          if (!(Test-Path "$asset.sig")) {
-            throw "Windows portable update signature was not generated"
-          }
-
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: matrix.platform == 'windows-x86_64'
         with:
@@ -245,50 +225,6 @@ jobs:
           name: windows-portable-update
           path: portable-update
 
-      - name: Generate signed Windows portable update manifest
-        env:
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          asset="cursor-byok-${VERSION}-windows-amd64.zip"
-          test -f "portable-update/${asset}"
-          test -f "portable-update/${asset}.sig"
-          node .github/scripts/generate-portable-update.mjs \
-            --version "${VERSION}" \
-            --repository "${GITHUB_REPOSITORY}" \
-            --asset "${asset}" \
-            --signature "portable-update/${asset}.sig" \
-            --output portable-update/portable-latest.json
-
-      - name: Normalize Tauri updater download URLs
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: |
-          mkdir -p tauri-update
-          release_id=$(
-            gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
-              --jq ".[] | select(.tag_name == \"v${VERSION}\") | .id"
-          )
-          test -n "${release_id}"
-          gh api "repos/${GITHUB_REPOSITORY}/releases/${release_id}" > tauri-update/release.json
-          asset_id=$(node -p 'require("./tauri-update/release.json").assets.find(({ name }) => name === "latest.json")?.id ?? ""')
-          test -n "${asset_id}"
-          gh api \
-            -H "Accept: application/octet-stream" \
-            "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}" \
-            > tauri-update/latest.json
-          node .github/scripts/normalize-tauri-update.mjs \
-            --manifest tauri-update/latest.json \
-            --release tauri-update/release.json \
-            --repository "${GITHUB_REPOSITORY}" \
-            --version "${VERSION}"
-
-      - name: Upload normalized Tauri updater manifest
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          VERSION: ${{ needs.prepare.outputs.version }}
-        run: gh release upload "v${VERSION}" tauri-update/latest.json --clobber
-
       - name: Upload Windows portable update and license notices
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -303,6 +239,10 @@ jobs:
         run: |
           set -euo pipefail
           assets=$(gh release view "v${VERSION}" --json assets --jq '[.assets[].name]')
+          if echo "${assets}" | jq -e 'any(.[]; . == "latest.json" or . == "portable-latest.json" or endswith(".sig"))' >/dev/null; then
+            echo "Unexpected updater metadata/signatures on draft; inspect stale assets before publishing." >&2
+            exit 1
+          fi
           for installer in \
             "cursor-byok-${VERSION}-macos-arm64.dmg" \
             "cursor-byok-${VERSION}-macos-x64.dmg" \
@@ -334,7 +274,7 @@ jobs:
           | Linux x64 (Debian/Ubuntu) | [Download DEB](https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/Cursor.BYOK_${VERSION}_amd64.deb) |
           | Linux x64 (Fedora/RHEL) | [Download RPM](https://github.com/${GITHUB_REPOSITORY}/releases/download/v${VERSION}/Cursor.BYOK-${VERSION}-1.x86_64.rpm) |
 
-          The other files in Assets, including signature files (.sig), latest.json and portable-latest.json, are used by automatic updates. macOS packages are ad-hoc signed and are not Apple-notarized.
+          Automatic updates are disabled in this build. Install future releases manually. No updater metadata or signatures are published. macOS packages are ad-hoc signed and are not Apple-notarized; Windows packages are not Authenticode-signed.
 
           **Changes:** https://github.com/${GITHUB_REPOSITORY}/commits/v${VERSION}
 

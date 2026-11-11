@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import {
+  AUTOMATIC_UPDATES_ENABLED,
   currentAppVersion,
   hasDockVisibilitySetting,
   hasNativeAppLifecycle,
@@ -153,7 +154,7 @@ export function AppLifecycleSettingsCard() {
           ? t("版本 {version} 可以安装", { version: availableVersion })
           : t("当前版本 {version}", { version })}</small>
       </div>
-      {availableVersion
+      {!AUTOMATIC_UPDATES_ENABLED ? <small>{t("此构建已禁用自动更新，请从 Accompany-cc/cursor-byok Releases 手动下载。")}</small> : availableVersion
         ? <Button size="small" variant="primary" disabled={installing} onClick={() => void updateNow()}>
             {installing ? t("安装中…") : t("下载并安装")}
             <span className={styles.updateDot} aria-hidden="true" />

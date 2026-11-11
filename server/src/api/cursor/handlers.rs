@@ -293,6 +293,16 @@ async fn bidi_handler(
 ) -> Result<Response<Body>> {
     let (parts, body) = buffered(request).await?;
     let request: ai::BidiAppendRequest = connect::decode_unary(&body)?;
+    if !request.data.is_empty() && !request.data_binary.is_empty() {
+        return Err(crate::Error::Protocol(
+            "BidiAppend contains both data and data_binary".into(),
+        ));
+    }
+    if request.data.is_empty() && request.data_binary.is_empty() {
+        return Err(crate::Error::Protocol(
+            "BidiAppend contains no AgentClientMessage".into(),
+        ));
+    }
     let request_id = request
         .request_id
         .as_ref()

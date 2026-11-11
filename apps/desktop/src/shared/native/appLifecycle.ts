@@ -56,7 +56,11 @@ type PortableUpdateInfo = {
   version: string;
 };
 
+// Independent updater signing has not been configured for this fork.
+export const AUTOMATIC_UPDATES_ENABLED = false;
+
 export async function checkForUpdate(): Promise<AppUpdate | null> {
+  if (!AUTOMATIC_UPDATES_ENABLED) return null;
   if (desktopPlatform() === "windows") {
     const update = await invoke<PortableUpdateInfo | null>("check_portable_update");
     if (!update) return null;
@@ -80,5 +84,6 @@ export async function checkForUpdate(): Promise<AppUpdate | null> {
 }
 
 export async function installUpdate(update: AppUpdate): Promise<void> {
+  if (!AUTOMATIC_UPDATES_ENABLED) throw new Error("Automatic updates are disabled in this build");
   await update.install();
 }

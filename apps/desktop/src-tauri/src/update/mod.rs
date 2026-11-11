@@ -21,9 +21,12 @@ mod replacement;
 
 #[cfg(target_os = "windows")]
 const PORTABLE_UPDATE_ENDPOINT: &str =
-    "https://github.com/leehainuo/cursor-byok/releases/latest/download/portable-latest.json";
+    "https://github.com/Accompany-cc/cursor-byok/releases/latest/download/portable-latest.json";
 #[cfg(any(target_os = "windows", test))]
 const WINDOWS_PAYLOAD_NAME: &str = "cursor-byok-desktop.exe";
+
+// Do not enable until this fork has its own signing key and verified release pipeline.
+const AUTOMATIC_UPDATES_ENABLED: bool = false;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -61,6 +64,9 @@ pub(crate) fn signal_ready_if_requested() -> std::io::Result<()> {
 pub(crate) async fn check_portable_update(
     app: AppHandle,
 ) -> Result<Option<PortableUpdateInfo>, String> {
+    if !AUTOMATIC_UPDATES_ENABLED {
+        return Ok(None);
+    }
     #[cfg(target_os = "windows")]
     {
         let update = portable_update(&app).await?;
@@ -80,6 +86,9 @@ pub(crate) async fn install_portable_update(
     app: AppHandle,
     expected_version: String,
 ) -> Result<(), String> {
+    if !AUTOMATIC_UPDATES_ENABLED {
+        return Err("automatic updates are disabled in this build".into());
+    }
     #[cfg(target_os = "windows")]
     {
         let update = portable_update(&app)

@@ -31,13 +31,23 @@ const repository = desktop.repository.url
   .replace(/\.git$/, "");
 assert.match(repository, /^[\w.-]+\/[\w.-]+$/, "invalid project repository");
 const releases = `https://github.com/${repository}/releases/latest/download`;
-assert.deepEqual(tauri.plugins.updater.endpoints, [`${releases}/latest.json`]);
-assert.ok(
-  read("apps/desktop/src-tauri/src/update/mod.rs").includes(`"${releases}/portable-latest.json"`),
-  "Windows updater must use the project repository",
-);
-const publicKey = Buffer.from(tauri.plugins.updater.pubkey, "base64").toString("utf8");
-assert.match(publicKey, /^untrusted comment: .+\n[\w+/=]+\s*$/, "invalid updater public key");
+assert.equal(repository, "Accompany-cc/cursor-byok");
+assert.equal(tauri.bundle.createUpdaterArtifacts, false);
+assert.deepEqual(tauri.plugins.updater.endpoints, []);
+assert.equal(tauri.plugins.updater.pubkey, "");
+const portable = read("apps/desktop/src-tauri/src/update/mod.rs");
+assert.ok(portable.includes(`"${releases}/portable-latest.json"`));
+assert.ok(portable.includes("const AUTOMATIC_UPDATES_ENABLED: bool = false;"));
+assert.equal((portable.match(/if !AUTOMATIC_UPDATES_ENABLED/g) ?? []).length, 2, "both Rust update commands must be gated");
+const lifecycle = read("apps/desktop/src/shared/native/appLifecycle.ts");
+assert.ok(lifecycle.includes("export const AUTOMATIC_UPDATES_ENABLED = false;"));
+assert.equal((lifecycle.match(/if \(!AUTOMATIC_UPDATES_ENABLED\)/g) ?? []).length, 2, "frontend checks and installation must be gated");
+assert.ok(!json("apps/desktop/src-tauri/capabilities/default.json").permissions.includes("updater:default"));
+assert.ok(!read("apps/desktop/src-tauri/src/desktop.rs").includes(".plugin(tauri_plugin_updater::"));
+const workflow = read(".github/workflows/release.yml");
+assert.ok(workflow.includes("uploadUpdaterJson: false"));
+assert.ok(!workflow.includes("secrets.TAURI_SIGNING_PRIVATE_KEY"));
+assert.ok(!workflow.includes("pull_request_target:"));
 for (const name of ["LICENSE", "THIRD-PARTY-LICENSES.md"]) {
   assert.equal(tauri.bundle.resources[`../../../${name}`], `licenses/${name}`);
   assert.ok(read(name).includes("MIT License"), `${name} must retain the MIT license`);

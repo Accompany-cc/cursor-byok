@@ -22,7 +22,6 @@
     "allow-set-dock-icon-visible",
     "clipboard-manager:allow-write-text",
     "autostart:default",
-    "process:allow-restart",
-    "updater:default"
+    "process:allow-restart"
   ]
 }
